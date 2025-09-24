@@ -1,0 +1,6 @@
+py-cord
+python-dotenv
+cerebras_cloud_sdk
+scikit-learn
+sqlalchemy
+chromadb
