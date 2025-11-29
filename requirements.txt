@@ -1,6 +1,7 @@
 py-cord
 python-dotenv
 cerebras_cloud_sdk
+openai
 scikit-learn
 sqlalchemy
-chromadb
+pydantic
