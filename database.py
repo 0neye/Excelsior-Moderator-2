@@ -53,6 +53,11 @@ class FlaggedMessage(Base):
     # List of message IDs used as context when deciding to flag
     context_message_ids = Column(JSON, nullable=True, default=list)
     
+    # Full context messages data (list of dicts with id, content, author info, etc.)
+    # Each dict contains: id, content, author_id, author_name, author_username,
+    # timestamp, edited_at, reference_id, attachments, reactions
+    context_messages = Column(JSON, nullable=True, default=list)
+    
     # Timestamps
     timestamp = Column(DateTime, nullable=False)  # Original message timestamp
     flagged_at = Column(DateTime, nullable=False, default=datetime.now(timezone.utc))

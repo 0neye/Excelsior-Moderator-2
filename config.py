@@ -5,6 +5,7 @@ load_dotenv()
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 # The text or forum channels to allow
 excelsior = [
@@ -31,7 +32,7 @@ DB_FILE = "excelsior.db"
 MESSAGES_PER_CHECK = 30
 
 # How many messages of history to send to the llm for analysis
-HISTORY_PER_CHECK = 50
+HISTORY_PER_CHECK = 60
 
 # If there are new messages in a channel that haven't been checked, but not enough to trigger the above, check anyway after this time
 # Resets after a new message, and doesn't trigger if all messages in channel have already been checked

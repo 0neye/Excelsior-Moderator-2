@@ -5,3 +5,6 @@ openai
 scikit-learn
 sqlalchemy
 pydantic
+lightgbm
+joblib
+numpy

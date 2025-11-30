@@ -1,14 +1,21 @@
 import asyncio
 import json
-from typing import Any
+from typing import Any, Literal
 
 from cerebras.cloud.sdk import Cerebras
+from openai import OpenAI
 
-from config import CEREBRAS_API_KEY
+from config import CEREBRAS_API_KEY, OPENROUTER_API_KEY
 from history import MessageStore
 from utils import format_message_history
 
 cerebras_client = Cerebras(api_key=CEREBRAS_API_KEY)
+
+# OpenRouter client using the OpenAI-compatible API
+openrouter_client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY
+)
 
 # JSON schema for structured output of candidate features
 CANDIDATE_FEATURES_SCHEMA = {
@@ -61,23 +68,26 @@ CANDIDATE_FEATURES_SCHEMA = {
 }
 
 
-async def get_candidate_features(message_store: MessageStore, channel_id: int) -> list[dict]:
+async def extract_features_from_formatted_history(
+    formatted_message_history: str,
+    channel_name: str,
+    thread_name: str | None = None,
+    provider: Literal["cerebras", "openrouter"] = "cerebras",
+    openrouter_model: str = "openai/gpt-oss-120b"
+) -> list[dict]:
     """
-    Identifies potential candidate messages to flag based on the message history.
-    Then asks a series of very specific questions about the message history to the LLM to extract features from each candidate.
+    Extracts candidate features from formatted message history using LLM.
+    
+    Args:
+        formatted_message_history: The formatted message history string
+        channel_name: Name of the Discord channel
+        thread_name: Optional name of the thread if applicable
+        provider: Which LLM provider to use ("cerebras" or "openrouter")
+        openrouter_model: The model to use when provider is "openrouter"
     
     Returns:
         A list of candidate dicts, each containing message_id, target_username, and features.
     """
-
-    channel_info = message_store.get_channel_info(channel_id)
-    if channel_info is None:
-        raise ValueError(f"Channel with ID {channel_id} not found in message store")
-    channel_name = channel_info.channel_name if not channel_info.is_thread else channel_info.parent_channel_name
-    thread_name = channel_info.channel_name if channel_info.is_thread else None
-
-    message_history = message_store.get_whole_history(channel_id)
-    formatted_message_history = format_message_history(message_history, use_username=True, include_timestamp=True)
 
     system_prompt = """
     You will be given a portion of a Discord channel's message history.
@@ -124,29 +134,79 @@ async def get_candidate_features(message_store: MessageStore, channel_id: int) -
     """
     # TODO: Add dictionary stuff in the future
 
-    # Run synchronous Cerebras API call in a thread pool to avoid blocking
-    response: Any = await asyncio.to_thread(
-        lambda: cerebras_client.chat.completions.create(
-            model="gpt-oss-120b",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "candidate_features",
-                    "strict": True,
-                    "schema": CANDIDATE_FEATURES_SCHEMA
-                }
-            },
-            stream=False,
-            max_completion_tokens=65536,
-            reasoning_effort="medium"
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    if provider == "cerebras":
+        # Run synchronous Cerebras API call in a thread pool to avoid blocking
+        response: Any = await asyncio.to_thread(
+            lambda: cerebras_client.chat.completions.create(
+                model="gpt-oss-120b",
+                messages=messages,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "candidate_features",
+                        "strict": True,
+                        "schema": CANDIDATE_FEATURES_SCHEMA
+                    }
+                },
+                stream=False,
+                max_completion_tokens=65536,
+                reasoning_effort="medium"
+            )
         )
-    )
+    elif provider == "openrouter":
+        # Run synchronous OpenRouter API call in a thread pool to avoid blocking
+        # Cast messages to Any since OpenAI SDK has strict typing
+        response = await asyncio.to_thread(
+            lambda: openrouter_client.chat.completions.create(
+                model=openrouter_model,
+                messages=messages,  # type: ignore[arg-type]
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "candidate_features",
+                        "strict": True,
+                        "schema": CANDIDATE_FEATURES_SCHEMA
+                    }
+                },
+                max_tokens=65536,
+                extra_body={"reasoning": {"enabled": True}}
+            )
+        )
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
     
     # Parse the structured JSON response
     content: str = response.choices[0].message.content
     result: dict[str, Any] = json.loads(content)
     return result["candidates"]
+
+
+async def get_candidate_features(message_store: MessageStore, channel_id: int) -> list[dict]:
+    """
+    Identifies potential candidate messages to flag based on the message history.
+    Then asks a series of very specific questions about the message history to the LLM to extract features from each candidate.
+    
+    Returns:
+        A list of candidate dicts, each containing message_id, target_username, and features.
+    """
+
+    channel_info = message_store.get_channel_info(channel_id)
+    if channel_info is None:
+        raise ValueError(f"Channel with ID {channel_id} not found in message store")
+    channel_name = channel_info.channel_name if not channel_info.is_thread else channel_info.parent_channel_name
+    thread_name = channel_info.channel_name if channel_info.is_thread else None
+
+    message_history = message_store.get_whole_history(channel_id)
+    formatted_message_history_list = format_message_history(message_history, use_username=True, include_timestamp=True)
+    formatted_message_history = "\n".join(formatted_message_history_list)
+
+    # Ensure channel_name is not None
+    if channel_name is None:
+        channel_name = "Unknown Channel"
+
+    return await extract_features_from_formatted_history(formatted_message_history, channel_name, thread_name)
