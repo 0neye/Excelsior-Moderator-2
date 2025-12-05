@@ -2,6 +2,7 @@ py-cord
 python-dotenv
 cerebras_cloud_sdk
 openai
+google-genai
 scikit-learn
 sqlalchemy
 pydantic

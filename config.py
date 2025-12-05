@@ -6,6 +6,7 @@ load_dotenv()
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # The text or forum channels to allow
 excelsior = [

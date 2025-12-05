@@ -446,7 +446,7 @@ def save_to_database(rated_messages: list[RatedMessage]) -> None:
 async def extract_features(
     rated_messages: list[RatedMessage],
     max_concurrent: int = 5,
-    provider: str = "openrouter",
+    provider: str = "gemini",
     openrouter_model: str = "openai/gpt-oss-120b"
 ) -> list[RatedMessage]:
     """
@@ -459,8 +459,9 @@ async def extract_features(
     Args:
         rated_messages: List of rated messages with context
         max_concurrent: Maximum number of concurrent API calls
-        provider: LLM provider to use ("cerebras" or "openrouter")
+        provider: LLM provider to use ("gemini", "openrouter", or "cerebras")
         openrouter_model: Model to use when provider is "openrouter"
+            (Gemini uses the default model configured in llms.py)
         
     Returns:
         List of messages with features extracted
@@ -531,6 +532,10 @@ async def extract_features(
                 
                 formatted_history = "\n".join(formatted_lines)
                 
+                # Determine the flagged message's relative ID so we can require it
+                flagged_rel_id = message_id_to_rel_id.get(rated_msg.message_id)
+                required_indexes = [flagged_rel_id] if flagged_rel_id else None
+                
                 # Call LLM to extract features
                 # Note: We use a generic channel name since we don't have it in the context
                 channel_name = "general"  # Could be improved by fetching channel info
@@ -540,11 +545,11 @@ async def extract_features(
                     channel_name,
                     thread_name=None,
                     provider=provider,  # type: ignore[arg-type]
-                    openrouter_model=openrouter_model
+                    openrouter_model=openrouter_model,
+                    required_message_indexes=required_indexes
                 )
                 
                 # Find features for the flagged message
-                flagged_rel_id = message_id_to_rel_id.get(rated_msg.message_id)
                 flagged_msg_id_str = str(rated_msg.message_id)
                 
                 features_found = False
@@ -796,7 +801,7 @@ def print_state():
 
 async def run_full_pipeline(
     max_concurrent: int = 5,
-    provider: str = "openrouter",
+    provider: str = "gemini",
     openrouter_model: str = "openai/gpt-oss-120b"
 ):
     """
@@ -804,7 +809,7 @@ async def run_full_pipeline(
     
     Args:
         max_concurrent: Maximum concurrent API calls for feature extraction
-        provider: LLM provider ("openrouter" or "cerebras")
+        provider: LLM provider ("gemini" default, or "openrouter"/"cerebras")
         openrouter_model: Model to use with OpenRouter
     """
     logger.info("Starting full bootstrapping pipeline...")
@@ -824,7 +829,7 @@ async def run_full_pipeline(
     # Save to database
     save_to_database(state.messages_with_context)
     
-    # Step 3: Extract features (parallel with OpenRouter)
+    # Step 3: Extract features (Gemini by default, concurrent requests)
     state.messages_with_features = await extract_features(
         state.messages_with_context,
         max_concurrent=max_concurrent,
@@ -949,10 +954,16 @@ async def repl():
         if choice == "1":
             # Full pipeline
             print("\nFeature extraction settings for full pipeline:")
-            print("1. openrouter (default)")
-            print("2. cerebras")
-            provider_choice = input("Select provider (1-2, default 1): ").strip()
-            provider = "cerebras" if provider_choice == "2" else "openrouter"
+            print("1. gemini (default)")
+            print("2. openrouter")
+            print("3. cerebras")
+            provider_choice = input("Select provider (1-3, default 1): ").strip()
+            if provider_choice == "2":
+                provider = "openrouter"
+            elif provider_choice == "3":
+                provider = "cerebras"
+            else:
+                provider = "gemini"
             
             openrouter_model = "openai/gpt-oss-120b"
             if provider == "openrouter":
@@ -993,10 +1004,16 @@ async def repl():
             
             # Prompt for extraction settings
             print("\nFeature extraction settings:")
-            print("1. openrouter (default)")
-            print("2. cerebras")
-            provider_choice = input("Select provider (1-2, default 1): ").strip()
-            provider = "cerebras" if provider_choice == "2" else "openrouter"
+            print("1. gemini (default)")
+            print("2. openrouter")
+            print("3. cerebras")
+            provider_choice = input("Select provider (1-3, default 1): ").strip()
+            if provider_choice == "2":
+                provider = "openrouter"
+            elif provider_choice == "3":
+                provider = "cerebras"
+            else:
+                provider = "gemini"
             
             openrouter_model = "openai/gpt-oss-120b"
             if provider == "openrouter":
