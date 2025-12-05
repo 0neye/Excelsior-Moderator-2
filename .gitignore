@@ -4,3 +4,5 @@ excelsior.db
 __pycache__/
 .env
 models/
+*.png
+*.json

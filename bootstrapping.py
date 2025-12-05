@@ -4,7 +4,7 @@ Provides a REPL menu for running full or partial training pipelines including:
 - Loading rated messages from rating_system_log.json
 - Fetching Discord context around flagged messages
 - Extracting LLM features from message history
-- Training LightGBM or MLP classifiers
+- Training LightGBM, MLP, or logistic regression classifiers
 - Evaluating model performance with metrics
 """
 
@@ -66,7 +66,8 @@ class RatedMessage:
     thread_name: str | None = None
     context_message_ids: list[int] = field(default_factory=list)
     context_messages: list[dict[str, Any]] = field(default_factory=list)
-    features: dict[str, float] | None = None
+    # Can hold multiple feature vectors when we repeat extraction for a single rating
+    features: list[dict[str, float]] | None = None
 
 
 @dataclass
@@ -82,6 +83,7 @@ class BootstrapState:
     model: Any = None
     model_type: str = "lightgbm"
     collapse_categories: bool = False
+    collapse_ambiguous_to_no_flag: bool = False
 
 
 # Global state for the REPL
@@ -524,6 +526,7 @@ def save_to_database(rated_messages: list[RatedMessage]) -> None:
 async def extract_features(
     rated_messages: list[RatedMessage],
     max_concurrent: int = 5,
+    runs_per_message: int = 1,
     provider: str = "gemini",
     openrouter_model: str = "openai/gpt-oss-120b"
 ) -> list[RatedMessage]:
@@ -532,11 +535,13 @@ async def extract_features(
     
     Formats the context messages and calls extract_features_from_formatted_history
     to get feature vectors for each flagged message. Runs API calls in parallel with
-    configurable concurrency.
+    configurable concurrency. When runs_per_message > 1, repeats extraction to collect
+    multiple stochastic feature vectors per rated message.
     
     Args:
         rated_messages: List of rated messages with context
         max_concurrent: Maximum number of concurrent API calls
+        runs_per_message: How many times to run feature extraction per message
         provider: LLM provider to use ("gemini", "openrouter", or "cerebras")
         openrouter_model: Model to use when provider is "openrouter"
             (Gemini uses the default model configured in llms.py)
@@ -546,6 +551,7 @@ async def extract_features(
     """
     logger.info(f"Extracting LLM features for {len(rated_messages)} messages...")
     logger.info(f"Provider: {provider}, Max concurrent: {max_concurrent}")
+    logger.info(f"Runs per message: {runs_per_message}")
     if provider == "openrouter":
         logger.info(f"OpenRouter model: {openrouter_model}")
     
@@ -617,31 +623,40 @@ async def extract_features(
                 # Call LLM to extract features with channel/thread context
                 channel_name, thread_name = resolve_channel_context(rated_msg)
                 
-                candidates = await extract_features_from_formatted_history(
-                    formatted_history,
-                    channel_name,
-                    thread_name,
-                    provider=provider,  # type: ignore[arg-type]
-                    openrouter_model=openrouter_model,
-                    required_message_indexes=required_indexes
-                )
+                feature_runs: list[dict[str, float]] = []
+                for run_idx in range(runs_per_message):
+                    candidates = await extract_features_from_formatted_history(
+                        formatted_history,
+                        channel_name,
+                        thread_name,
+                        provider=provider,  # type: ignore[arg-type]
+                        openrouter_model=openrouter_model,
+                        required_message_indexes=required_indexes
+                    )
+                    
+                    # Find features for the flagged message in this run
+                    flagged_msg_id_str = str(rated_msg.message_id)
+                    
+                    features_found = False
+                    selected_features: dict[str, float] = {}
+                    for candidate in candidates:
+                        # Match by message_id or relative_id
+                        if (candidate.get("message_id") == flagged_msg_id_str or 
+                            candidate.get("message_id") == str(flagged_rel_id)):
+                            selected_features = candidate.get("features", {})
+                            features_found = True
+                            break
+                    
+                    if not features_found:
+                        # If LLM didn't identify the flagged message as a candidate, use zero features
+                        logger.warning(
+                            f"LLM did not identify message {rated_msg.message_id} as candidate on run {run_idx + 1}, using zero features"
+                        )
+                        selected_features = {name: 0.0 for name in FEATURE_NAMES}
+                    
+                    feature_runs.append(selected_features)
                 
-                # Find features for the flagged message
-                flagged_msg_id_str = str(rated_msg.message_id)
-                
-                features_found = False
-                for candidate in candidates:
-                    # Match by message_id or relative_id
-                    if (candidate.get("message_id") == flagged_msg_id_str or 
-                        candidate.get("message_id") == str(flagged_rel_id)):
-                        rated_msg.features = candidate.get("features", {})
-                        features_found = True
-                        break
-                
-                if not features_found:
-                    # If LLM didn't identify the flagged message as a candidate, use zero features
-                    logger.warning(f"LLM did not identify message {rated_msg.message_id} as candidate, using zero features")
-                    rated_msg.features = {name: 0.0 for name in FEATURE_NAMES}
+                rated_msg.features = feature_runs
                 
                 # Update progress
                 async with lock:
@@ -677,12 +692,16 @@ async def extract_features(
 # STEP 4: Train Model
 # =============================================================================
 
-def collapse_category_label(category: str) -> str:
+def collapse_category_label(
+    category: str,
+    collapse_ambiguous_to_no_flag: bool = False
+) -> str:
     """
     Normalize category labels when collapsing classes.
     
     Args:
         category: Original rating category
+        collapse_ambiguous_to_no_flag: Whether to map ambiguous to no-flag
         
     Returns:
         Collapsed category label following the mapping rules
@@ -691,6 +710,8 @@ def collapse_category_label(category: str) -> str:
         return "no-flag"
     if category in {"unsolicited", "unconstructive"}:
         return "flag"
+    if collapse_ambiguous_to_no_flag and category == "ambiguous":
+        return "no-flag"
     return category
 
 
@@ -698,7 +719,8 @@ def prepare_training_data(
     messages_with_features: list[RatedMessage],
     test_size: float = 0.2,
     random_state: int = 42,
-    collapse_categories: bool = False
+    collapse_categories: bool = False,
+    collapse_ambiguous_to_no_flag: bool = False
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Prepare feature matrices and labels for training.
@@ -708,33 +730,86 @@ def prepare_training_data(
         test_size: Fraction of data to use for testing
         random_state: Random seed for reproducibility
         collapse_categories: Whether to merge rating categories into broader buckets
+        collapse_ambiguous_to_no_flag: Whether to map ambiguous to no-flag when collapsing
         
     Returns:
         Tuple of (X_train, X_test, y_train, y_test)
     """
     logger.info(f"Preparing training data from {len(messages_with_features)} messages...")
     
+    def filter_discusses_ellie_messages(
+        messages: list[RatedMessage],
+        threshold: float = 0.2
+    ) -> list[RatedMessage]:
+        """
+        Drop messages that mention the Ellie topic above a threshold.
+        
+        Args:
+            messages: Messages with extracted features
+            threshold: Score cutoff for excluding a message
+            
+        Returns:
+            Filtered messages safe for model training
+        """
+        filtered: list[RatedMessage] = []
+        removed_count = 0
+        
+        for msg in messages:
+            if msg.features is None:
+                filtered.append(msg)
+                continue
+            
+            feature_payloads = msg.features if isinstance(msg.features, list) else [msg.features]
+            exceeds_threshold = any(
+                payload.get("discusses_ellie", 0.0) > threshold for payload in feature_payloads
+            )
+            
+            if exceeds_threshold:
+                removed_count += 1
+                continue
+            
+            filtered.append(msg)
+        
+        logger.info(
+            "Filtered %d messages with discusses_ellie > %.2f (remaining: %d)",
+            removed_count,
+            threshold,
+            len(filtered),
+        )
+        return filtered
+
+    # Remove high discusses_ellie messages to keep training data clean
+    messages_with_features = filter_discusses_ellie_messages(messages_with_features)
+
     # Build feature matrix
     X = []
     y = []
+    total_feature_vectors = 0
     
     for msg in messages_with_features:
         if msg.features is None:
             continue
         
-        # Extract features in consistent order
-        feature_vector = [msg.features.get(name, 0.0) for name in FEATURE_NAMES]
-        X.append(feature_vector)
+        feature_payloads = msg.features if isinstance(msg.features, list) else [msg.features]
         
-        label = msg.category
-        if collapse_categories:
-            label = collapse_category_label(label)
-        y.append(label)
+        for feature_payload in feature_payloads:
+            # Extract features in consistent order
+            feature_vector = [feature_payload.get(name, 0.0) for name in FEATURE_NAMES]
+            X.append(feature_vector)
+            
+            label = msg.category
+            if collapse_categories:
+                label = collapse_category_label(
+                    label,
+                    collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag
+                )
+            y.append(label)
+            total_feature_vectors += 1
     
     X = np.array(X)
     y = np.array(y)
     
-    logger.info(f"Feature matrix shape: {X.shape}")
+    logger.info(f"Feature matrix shape: {X.shape} built from {total_feature_vectors} feature vectors")
     label_distribution = dict(zip(*np.unique(y, return_counts=True)))
     distribution_label = "collapsed label distribution" if collapse_categories else "label distribution"
     logger.info(f"{distribution_label}: {label_distribution}")
@@ -761,7 +836,7 @@ def train_model(
     Args:
         X_train: Training feature matrix
         y_train: Training labels
-        model_type: Type of model to train ('lightgbm' or 'mlp')
+        model_type: Type of model to train ('lightgbm', 'mlp', or 'logistic')
         
     Returns:
         Trained classifier
@@ -878,7 +953,7 @@ def print_menu():
     print("2. Load data only (from rating_system_log.json)")
     print("3. Fetch Discord context (requires bot connection)")
     print("4. Extract LLM features (from stored context)")
-    print("5. Train model (LightGBM or MLP)")
+    print("5. Train model (LightGBM, MLP, or logistic regression)")
     print("6. Evaluate model (on held-out test set)")
     print("7. Show current state")
     print("8. Save/Load state to file")
@@ -892,6 +967,9 @@ def print_state():
     print(f"Rated messages loaded: {len(state.rated_messages)}")
     print(f"Messages with context: {len(state.messages_with_context)}")
     print(f"Messages with features: {len(state.messages_with_features)}")
+    total_feature_vectors = sum(len(msg.features or []) for msg in state.messages_with_features)
+    if total_feature_vectors:
+        print(f"Feature vectors available: {total_feature_vectors}")
     print(f"Training data prepared: {state.X_train is not None}")
     if state.X_train is not None and state.y_train is not None and state.y_test is not None:
         print(f"  Train samples: {len(state.y_train)}")
@@ -899,23 +977,29 @@ def print_state():
     print(f"Model trained: {state.model is not None}")
     print(f"Model type: {state.model_type}")
     print(f"Collapse categories: {state.collapse_categories}")
+    if state.collapse_categories:
+        print(f"  Collapse ambiguous to no-flag: {state.collapse_ambiguous_to_no_flag}")
     print("---")
 
 
 async def run_full_pipeline(
     max_concurrent: int = 5,
+    runs_per_message: int = 1,
     provider: str = "gemini",
     openrouter_model: str = "openai/gpt-oss-120b",
-    collapse_categories: bool = False
+    collapse_categories: bool = False,
+    collapse_ambiguous_to_no_flag: bool = False
 ):
     """
     Run the complete bootstrapping pipeline.
     
     Args:
         max_concurrent: Maximum concurrent API calls for feature extraction
+        runs_per_message: How many times to extract features per rated message
         provider: LLM provider ("gemini" default, or "openrouter"/"cerebras")
         openrouter_model: Model to use with OpenRouter
         collapse_categories: Whether to collapse rating categories before training
+        collapse_ambiguous_to_no_flag: Whether to map ambiguous to no-flag when collapsing
     """
     logger.info("Starting full bootstrapping pipeline...")
     
@@ -938,6 +1022,7 @@ async def run_full_pipeline(
     state.messages_with_features = await extract_features(
         state.messages_with_context,
         max_concurrent=max_concurrent,
+        runs_per_message=runs_per_message,
         provider=provider,
         openrouter_model=openrouter_model
     )
@@ -949,13 +1034,20 @@ async def run_full_pipeline(
     logger.info(f"Collapsing categories for training: {collapse_categories}")
     X_train, X_test, y_train, y_test = prepare_training_data(
         state.messages_with_features,
-        collapse_categories=collapse_categories
+        collapse_categories=collapse_categories,
+        collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag
     )
     state.X_train = X_train
     state.X_test = X_test
     state.y_train = y_train
     state.y_test = y_test
     state.collapse_categories = collapse_categories
+    state.collapse_ambiguous_to_no_flag = collapse_ambiguous_to_no_flag
+    if collapse_categories:
+        logger.info(
+            "Collapse ambiguous into no-flag enabled: %s",
+            collapse_ambiguous_to_no_flag
+        )
     
     state.model = train_model(X_train, y_train, state.model_type)
     
@@ -998,6 +1090,8 @@ def save_state_to_file(filepath: str = "bootstrap_state.json"):
     state_data = {
         "messages": serializable_messages,
         "model_type": state.model_type,
+        "collapse_categories": state.collapse_categories,
+        "collapse_ambiguous_to_no_flag": state.collapse_ambiguous_to_no_flag,
     }
     
     with open(filepath, "w", encoding="utf-8") as f:
@@ -1020,6 +1114,14 @@ def load_state_from_file(filepath: str = "bootstrap_state.json"):
     # Deserialize messages
     messages = []
     for msg_data in state_data["messages"]:
+        raw_features = msg_data.get("features")
+        normalized_features: list[dict[str, float]] | None = None
+        if isinstance(raw_features, list):
+            normalized_features = raw_features
+        elif isinstance(raw_features, dict):
+            # Backward compatibility for states saved before multi-run support
+            normalized_features = [raw_features]
+        
         msg = RatedMessage(
             message_id=msg_data["message_id"],
             channel_id=msg_data["channel_id"],
@@ -1037,7 +1139,7 @@ def load_state_from_file(filepath: str = "bootstrap_state.json"):
             rating_id=msg_data["rating_id"],
             context_message_ids=msg_data.get("context_message_ids", []),
             context_messages=msg_data.get("context_messages", []),
-            features=msg_data.get("features"),
+            features=normalized_features,
         )
         messages.append(msg)
     
@@ -1046,6 +1148,8 @@ def load_state_from_file(filepath: str = "bootstrap_state.json"):
     state.messages_with_context = [m for m in messages if m.context_messages]
     state.messages_with_features = [m for m in messages if m.features]
     state.model_type = state_data.get("model_type", "lightgbm")
+    state.collapse_categories = state_data.get("collapse_categories", False)
+    state.collapse_ambiguous_to_no_flag = state_data.get("collapse_ambiguous_to_no_flag", False)
     
     logger.info(f"State loaded: {len(messages)} messages")
     logger.info(f"  With context: {len(state.messages_with_context)}")
@@ -1088,14 +1192,36 @@ async def repl():
             
             max_concurrent_input = input("Max concurrent API calls (default: 5): ").strip()
             max_concurrent = int(max_concurrent_input) if max_concurrent_input.isdigit() else 5
+            runs_input = input("Feature extraction runs per message (default: 1): ").strip()
+            runs_per_message = int(runs_input) if runs_input.isdigit() else 1
             collapse_input = input("Collapse categories for training? (y/N): ").strip().lower()
             collapse_categories = collapse_input in {"y", "yes"}
+            collapse_ambiguous_to_no_flag = False
+            if collapse_categories:
+                collapse_ambiguous_input = input(
+                    "Collapse ambiguous into no-flag? (y/N): "
+                ).strip().lower()
+                collapse_ambiguous_to_no_flag = collapse_ambiguous_input in {"y", "yes"}
             
+            print("\nSelect model type for training:")
+            print("1. LightGBM (faster, interpretable)")
+            print("2. MLP (neural network)")
+            print("3. Logistic regression (linear baseline)")
+            model_choice_full = input("Enter choice (1-3): ").strip()
+            if model_choice_full == "2":
+                state.model_type = "mlp"
+            elif model_choice_full == "3":
+                state.model_type = "logistic"
+            else:
+                state.model_type = "lightgbm"
+
             await run_full_pipeline(
                 max_concurrent=max_concurrent,
+                runs_per_message=runs_per_message,
                 provider=provider,
                 openrouter_model=openrouter_model,
-                collapse_categories=collapse_categories
+                collapse_categories=collapse_categories,
+                collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag
             )
             
         elif choice == "2":
@@ -1141,10 +1267,13 @@ async def repl():
             
             max_concurrent_input = input("Max concurrent API calls (default: 5): ").strip()
             max_concurrent = int(max_concurrent_input) if max_concurrent_input.isdigit() else 5
+            runs_input = input("Feature extraction runs per message (default: 1): ").strip()
+            runs_per_message = int(runs_input) if runs_input.isdigit() else 1
             
             state.messages_with_features = await extract_features(
                 messages,
                 max_concurrent=max_concurrent,
+                runs_per_message=runs_per_message,
                 provider=provider,
                 openrouter_model=openrouter_model
             )
@@ -1160,17 +1289,31 @@ async def repl():
             print("\nSelect model type:")
             print("1. LightGBM (faster, interpretable)")
             print("2. MLP (neural network)")
-            model_choice = input("Enter choice (1-2): ").strip()
-            state.model_type = "mlp" if model_choice == "2" else "lightgbm"
+            print("3. Logistic regression (linear baseline)")
+            model_choice = input("Enter choice (1-3): ").strip()
+            if model_choice == "2":
+                state.model_type = "mlp"
+            elif model_choice == "3":
+                state.model_type = "logistic"
+            else:
+                state.model_type = "lightgbm"
             
             collapse_input = input("Collapse categories for training? (y/N): ").strip().lower()
             collapse_categories = collapse_input in {"y", "yes"}
             state.collapse_categories = collapse_categories
+            collapse_ambiguous_to_no_flag = False
+            if collapse_categories:
+                collapse_ambiguous_input = input(
+                    "Collapse ambiguous into no-flag? (y/N): "
+                ).strip().lower()
+                collapse_ambiguous_to_no_flag = collapse_ambiguous_input in {"y", "yes"}
+            state.collapse_ambiguous_to_no_flag = collapse_ambiguous_to_no_flag
             
             # Always prepare data with the selected category handling
             state.X_train, state.X_test, state.y_train, state.y_test = prepare_training_data(
                 state.messages_with_features,
-                collapse_categories=collapse_categories
+                collapse_categories=collapse_categories,
+                collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag
             )
             
             if state.X_train is not None and state.y_train is not None:

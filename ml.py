@@ -10,6 +10,7 @@ from typing import Any
 
 import joblib
 import numpy as np
+from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier as SklearnMLP
 from sklearn.preprocessing import LabelEncoder
 
@@ -147,9 +148,9 @@ class LightGBMClassifier(ModerationClassifier):
     def __init__(
         self,
         n_estimators: int = 100,
-        max_depth: int = 6,
+        max_depth: int = 7,
         learning_rate: float = 0.1,
-        num_leaves: int = 31,
+        num_leaves: int = 50,
         class_weight: str | dict | None = "balanced",
         random_state: int = 42,
     ):
@@ -252,6 +253,135 @@ class LightGBMClassifier(ModerationClassifier):
         return dict(zip(FEATURE_NAMES, importances))
 
 
+class LogisticRegressionClassifier(ModerationClassifier):
+    """Logistic regression classifier for moderation."""
+
+    def __init__(
+        self,
+        C: float = 1.0,
+        penalty: str = "l2",
+        solver: str = "lbfgs",
+        max_iter: int = 1000,
+        class_weight: str | dict | None = "balanced",
+        multi_class: str = "auto",
+        n_jobs: int | None = None,
+        random_state: int | None = 42,
+    ):
+        """
+        Initialize logistic regression classifier.
+
+        Args:
+            C: Inverse regularization strength (smaller is stronger)
+            penalty: Regularization type ('l1', 'l2', 'elasticnet', 'none')
+            solver: Optimization solver compatible with the penalty choice
+            max_iter: Maximum iterations for the solver to converge
+            class_weight: Per-class weights or 'balanced' for inverse-frequency
+            multi_class: Multi-class handling strategy ('auto', 'multinomial', 'ovr')
+            n_jobs: Parallel jobs for fitting if supported by solver
+            random_state: Seed for reproducible results when supported
+        """
+        super().__init__()
+        self.C = C
+        self.penalty = penalty
+        self.solver = solver
+        self.max_iter = max_iter
+        self.class_weight = class_weight
+        self.multi_class = multi_class
+        self.n_jobs = n_jobs
+        self.random_state = random_state
+        self.model: LogisticRegression | None = None
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        """Train the logistic regression classifier."""
+        logger.info(f"Training logistic regression with {len(y)} samples...")
+
+        # Encode labels to integers for sklearn
+        y_encoded = self.label_encoder.fit_transform(y)
+        classes = self.label_encoder.classes_
+        n_classes = len(classes) if classes is not None else 0
+
+        logger.info(f"Classes: {list(classes) if classes is not None else []}")
+        logger.info(f"Class distribution: {dict(zip(*np.unique(y, return_counts=True)))}")
+
+        # Create sklearn LogisticRegression model
+        self.model = LogisticRegression(
+            C=self.C,
+            penalty=self.penalty,
+            solver=self.solver,
+            max_iter=self.max_iter,
+            class_weight=self.class_weight,
+            multi_class=self.multi_class if n_classes > 2 else "auto",
+            n_jobs=self.n_jobs,
+            random_state=self.random_state,
+        )
+
+        self.model.fit(X, y_encoded)
+        self.is_fitted = True
+        logger.info("Logistic regression training complete")
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict class labels."""
+        if not self.is_fitted or self.model is None:
+            raise ValueError("Model must be fitted before prediction")
+
+        y_pred_encoded = self.model.predict(X)
+        return self.label_encoder.inverse_transform(y_pred_encoded)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Predict class probabilities."""
+        if not self.is_fitted or self.model is None:
+            raise ValueError("Model must be fitted before prediction")
+
+        return np.array(self.model.predict_proba(X))
+
+    def _get_model_data(self) -> dict[str, Any]:
+        """Get logistic regression model data for serialization."""
+        return {
+            "model": self.model,
+            "C": self.C,
+            "penalty": self.penalty,
+            "solver": self.solver,
+            "max_iter": self.max_iter,
+            "class_weight": self.class_weight,
+            "multi_class": self.multi_class,
+            "n_jobs": self.n_jobs,
+            "random_state": self.random_state,
+        }
+
+    def _set_model_data(self, data: dict[str, Any]) -> None:
+        """Set logistic regression model data from deserialization."""
+        self.model = data["model"]
+        self.C = data["C"]
+        self.penalty = data["penalty"]
+        self.solver = data["solver"]
+        self.max_iter = data["max_iter"]
+        self.class_weight = data["class_weight"]
+        self.multi_class = data["multi_class"]
+        self.n_jobs = data["n_jobs"]
+        self.random_state = data["random_state"]
+
+    def get_feature_importance(self) -> dict[str, float]:
+        """
+        Get feature importance from absolute coefficient magnitudes.
+
+        Uses the mean absolute coefficient across classes as a simple proxy.
+        """
+        if not self.is_fitted or self.model is None:
+            raise ValueError("Model must be fitted before getting feature importance")
+
+        coefficients = np.abs(self.model.coef_)
+        # Average importance across classes for multiclass settings
+        importances = coefficients.mean(axis=0)
+        importance_sum = importances.sum()
+        if importance_sum == 0:
+            # Avoid division by zero; return zeros if model produced zero weights
+            normalized_importances = np.zeros_like(importances)
+        else:
+            normalized_importances = importances / importance_sum
+
+        return dict(zip(FEATURE_NAMES, normalized_importances))
+
+
 class MLPModerationClassifier(ModerationClassifier):
     """Multi-layer perceptron classifier for moderation."""
 
@@ -263,6 +393,7 @@ class MLPModerationClassifier(ModerationClassifier):
         max_iter: int = 500,
         early_stopping: bool = True,
         random_state: int = 42,
+        alpha: float = 0.01,
     ):
         """
         Initialize MLP classifier.
@@ -274,6 +405,7 @@ class MLPModerationClassifier(ModerationClassifier):
             max_iter: Maximum number of iterations
             early_stopping: Whether to use early stopping
             random_state: Random seed for reproducibility
+            alpha: L2 regularization strength
         """
         super().__init__()
         self.hidden_layer_sizes = hidden_layer_sizes
@@ -282,6 +414,7 @@ class MLPModerationClassifier(ModerationClassifier):
         self.max_iter = max_iter
         self.early_stopping = early_stopping
         self.random_state = random_state
+        self.alpha = alpha
         self.model: SklearnMLP | None = None
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
@@ -303,6 +436,7 @@ class MLPModerationClassifier(ModerationClassifier):
             max_iter=self.max_iter,
             early_stopping=self.early_stopping,
             random_state=self.random_state,
+            alpha=self.alpha,
             verbose=True,
         )
 
@@ -335,6 +469,7 @@ class MLPModerationClassifier(ModerationClassifier):
             "max_iter": self.max_iter,
             "early_stopping": self.early_stopping,
             "random_state": self.random_state,
+            "alpha": self.alpha,
         }
 
     def _set_model_data(self, data: dict[str, Any]) -> None:
@@ -346,6 +481,7 @@ class MLPModerationClassifier(ModerationClassifier):
         self.max_iter = data["max_iter"]
         self.early_stopping = data["early_stopping"]
         self.random_state = data["random_state"]
+        self.alpha = data["alpha"]
 
     def get_feature_importance(self) -> dict[str, float]:
         """
@@ -370,15 +506,20 @@ def create_classifier(model_type: str = "lightgbm", **kwargs) -> ModerationClass
     Factory function to create a classifier by type.
 
     Args:
-        model_type: Type of classifier ('lightgbm' or 'mlp')
+        model_type: Type of classifier ('lightgbm', 'mlp', or 'logistic')
         **kwargs: Additional arguments passed to the classifier constructor
 
     Returns:
         Initialized classifier instance
     """
-    if model_type.lower() == "lightgbm":
+    model_type_lower = model_type.lower()
+    if model_type_lower == "lightgbm":
         return LightGBMClassifier(**kwargs)
-    elif model_type.lower() == "mlp":
+    elif model_type_lower == "mlp":
         return MLPModerationClassifier(**kwargs)
+    elif model_type_lower in {"logistic", "logistic_regression", "logreg"}:
+        return LogisticRegressionClassifier(**kwargs)
     else:
-        raise ValueError(f"Unknown model type: {model_type}. Use 'lightgbm' or 'mlp'")
+        raise ValueError(
+            f"Unknown model type: {model_type}. Use 'lightgbm', 'mlp', or 'logistic'"
+        )
