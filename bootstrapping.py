@@ -62,6 +62,8 @@ class RatedMessage:
     category: str  # Rating category (no-flag, unsolicited, unconstructive, ambiguous, NA)
     rater_user_id: int
     rating_id: str
+    channel_name: str | None = None
+    thread_name: str | None = None
     context_message_ids: list[int] = field(default_factory=list)
     context_messages: list[dict[str, Any]] = field(default_factory=list)
     features: dict[str, float] | None = None
@@ -79,10 +81,64 @@ class BootstrapState:
     y_test: np.ndarray | None = None
     model: Any = None
     model_type: str = "lightgbm"
+    collapse_categories: bool = False
 
 
 # Global state for the REPL
 state = BootstrapState()
+
+
+def extract_channel_thread_from_context(
+    context_messages: list[dict[str, Any]]
+) -> tuple[str | None, str | None]:
+    """
+    Pull channel and thread names from stored context metadata if present.
+    
+    Args:
+        context_messages: Serialized context message payloads
+        
+    Returns:
+        Tuple of (channel_name, thread_name) if available, otherwise (None, None)
+    """
+    if not context_messages:
+        return None, None
+    
+    first_context = context_messages[0]
+    channel_name = first_context.get("channel_name") or first_context.get("parent_channel_name")
+    thread_name = first_context.get("thread_name")
+    return channel_name, thread_name
+
+
+def resolve_channel_context(rated_msg: RatedMessage) -> tuple[str, str | None]:
+    """
+    Resolve channel and thread names for feature extraction with fallbacks.
+    
+    Prefers values stored directly on the rated message, then falls back to
+    the serialized context payload. Ensures a non-empty channel name is
+    always returned for the LLM prompt.
+    
+    Args:
+        rated_msg: Rated message containing serialized context
+        
+    Returns:
+        Tuple of (channel_name, thread_name)
+    """
+    channel_name = rated_msg.channel_name
+    thread_name = rated_msg.thread_name
+    
+    stored_channel, stored_thread = extract_channel_thread_from_context(rated_msg.context_messages)
+    if channel_name is None:
+        channel_name = stored_channel
+    if thread_name is None:
+        thread_name = stored_thread
+    
+    # Ensure channel_name is populated for LLM calls
+    if channel_name is None and stored_channel is not None:
+        channel_name = stored_channel
+    if channel_name is None:
+        channel_name = "Unknown Channel"
+    
+    return channel_name, thread_name
 
 
 # =============================================================================
@@ -148,6 +204,8 @@ def load_rating_data() -> list[RatedMessage]:
             timestamp=msg_data["timestamp"],
             flagged_at=msg_data["flagged_at"],
             jump_url=msg_data["jump_url"],
+            channel_name=msg_data.get("channel_name"),
+            thread_name=msg_data.get("thread_name"),
             category=category,
             rater_user_id=rating["rater_user_id"],
             rating_id=rating["rating_id"],
@@ -201,6 +259,11 @@ async def fetch_discord_context(rated_messages: list[RatedMessage]) -> list[Rate
             if existing and existing.context_messages:  # type: ignore[truthy-bool]
                 rated_msg.context_message_ids = existing.context_message_ids or []  # type: ignore[assignment]
                 rated_msg.context_messages = existing.context_messages  # type: ignore[assignment]
+                cached_channel_name, cached_thread_name = extract_channel_thread_from_context(
+                    rated_msg.context_messages
+                )
+                rated_msg.channel_name = rated_msg.channel_name or cached_channel_name
+                rated_msg.thread_name = rated_msg.thread_name or cached_thread_name
                 messages_with_context.append(rated_msg)
                 logger.debug(f"Using cached context for message {rated_msg.message_id}")
             else:
@@ -263,6 +326,16 @@ async def fetch_discord_context(rated_messages: list[RatedMessage]) -> list[Rate
                 logger.warning(f"Channel {channel_id} is not a text channel, skipping")
                 continue
             
+            # Capture channel/thread names once per channel to reuse for each message
+            parent_channel_name: str | None = None
+            thread_name: str | None = None
+            if isinstance(channel, discord.Thread):
+                thread_name = channel.name
+                parent_channel_name = channel.parent.name if channel.parent else None
+                channel_name = parent_channel_name or channel.name
+            else:
+                channel_name = channel.name
+            
             for rated_msg in channel_messages:
                 try:
                     # Fetch messages around the flagged message
@@ -302,6 +375,8 @@ async def fetch_discord_context(rated_messages: list[RatedMessage]) -> list[Rate
                     
                     # Store context message IDs and serialized data
                     rated_msg.context_message_ids = [m.id for m in context_messages]
+                    rated_msg.channel_name = channel_name
+                    rated_msg.thread_name = thread_name
                     rated_msg.context_messages = [
                         {
                             "id": m.id,
@@ -314,6 +389,9 @@ async def fetch_discord_context(rated_messages: list[RatedMessage]) -> list[Rate
                             "reference_id": m.reference.message_id if m.reference else None,
                             "attachments": len(m.attachments) > 0,
                             "reactions": [(str(r.emoji), r.count) for r in m.reactions],
+                            "channel_name": channel_name,
+                            "parent_channel_name": parent_channel_name,
+                            "thread_name": thread_name,
                         }
                         for m in context_messages
                     ]
@@ -536,14 +614,13 @@ async def extract_features(
                 flagged_rel_id = message_id_to_rel_id.get(rated_msg.message_id)
                 required_indexes = [flagged_rel_id] if flagged_rel_id else None
                 
-                # Call LLM to extract features
-                # Note: We use a generic channel name since we don't have it in the context
-                channel_name = "general"  # Could be improved by fetching channel info
+                # Call LLM to extract features with channel/thread context
+                channel_name, thread_name = resolve_channel_context(rated_msg)
                 
                 candidates = await extract_features_from_formatted_history(
                     formatted_history,
                     channel_name,
-                    thread_name=None,
+                    thread_name,
                     provider=provider,  # type: ignore[arg-type]
                     openrouter_model=openrouter_model,
                     required_message_indexes=required_indexes
@@ -600,10 +677,28 @@ async def extract_features(
 # STEP 4: Train Model
 # =============================================================================
 
+def collapse_category_label(category: str) -> str:
+    """
+    Normalize category labels when collapsing classes.
+    
+    Args:
+        category: Original rating category
+        
+    Returns:
+        Collapsed category label following the mapping rules
+    """
+    if category in {"NA", "no-flag"}:
+        return "no-flag"
+    if category in {"unsolicited", "unconstructive"}:
+        return "flag"
+    return category
+
+
 def prepare_training_data(
     messages_with_features: list[RatedMessage],
     test_size: float = 0.2,
-    random_state: int = 42
+    random_state: int = 42,
+    collapse_categories: bool = False
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Prepare feature matrices and labels for training.
@@ -612,6 +707,7 @@ def prepare_training_data(
         messages_with_features: List of messages with extracted features
         test_size: Fraction of data to use for testing
         random_state: Random seed for reproducibility
+        collapse_categories: Whether to merge rating categories into broader buckets
         
     Returns:
         Tuple of (X_train, X_test, y_train, y_test)
@@ -629,13 +725,19 @@ def prepare_training_data(
         # Extract features in consistent order
         feature_vector = [msg.features.get(name, 0.0) for name in FEATURE_NAMES]
         X.append(feature_vector)
-        y.append(msg.category)
+        
+        label = msg.category
+        if collapse_categories:
+            label = collapse_category_label(label)
+        y.append(label)
     
     X = np.array(X)
     y = np.array(y)
     
     logger.info(f"Feature matrix shape: {X.shape}")
-    logger.info(f"Label distribution: {dict(zip(*np.unique(y, return_counts=True)))}")
+    label_distribution = dict(zip(*np.unique(y, return_counts=True)))
+    distribution_label = "collapsed label distribution" if collapse_categories else "label distribution"
+    logger.info(f"{distribution_label}: {label_distribution}")
     
     # Stratified train/test split
     X_train, X_test, y_train, y_test = train_test_split(
@@ -796,13 +898,15 @@ def print_state():
         print(f"  Test samples: {len(state.y_test)}")
     print(f"Model trained: {state.model is not None}")
     print(f"Model type: {state.model_type}")
+    print(f"Collapse categories: {state.collapse_categories}")
     print("---")
 
 
 async def run_full_pipeline(
     max_concurrent: int = 5,
     provider: str = "gemini",
-    openrouter_model: str = "openai/gpt-oss-120b"
+    openrouter_model: str = "openai/gpt-oss-120b",
+    collapse_categories: bool = False
 ):
     """
     Run the complete bootstrapping pipeline.
@@ -811,6 +915,7 @@ async def run_full_pipeline(
         max_concurrent: Maximum concurrent API calls for feature extraction
         provider: LLM provider ("gemini" default, or "openrouter"/"cerebras")
         openrouter_model: Model to use with OpenRouter
+        collapse_categories: Whether to collapse rating categories before training
     """
     logger.info("Starting full bootstrapping pipeline...")
     
@@ -841,18 +946,24 @@ async def run_full_pipeline(
         return
     
     # Step 4: Prepare data and train
+    logger.info(f"Collapsing categories for training: {collapse_categories}")
     X_train, X_test, y_train, y_test = prepare_training_data(
-        state.messages_with_features
+        state.messages_with_features,
+        collapse_categories=collapse_categories
     )
     state.X_train = X_train
     state.X_test = X_test
     state.y_train = y_train
     state.y_test = y_test
+    state.collapse_categories = collapse_categories
     
     state.model = train_model(X_train, y_train, state.model_type)
     
     # Step 5: Evaluate
     evaluate_model(state.model, X_test, y_test)
+    
+    # Step 6: Persist pipeline state for resumption/debugging
+    save_state_to_file()
     
     logger.info("Full pipeline complete!")
 
@@ -874,6 +985,8 @@ def save_state_to_file(filepath: str = "bootstrap_state.json"):
             "timestamp": msg.timestamp,
             "flagged_at": msg.flagged_at,
             "jump_url": msg.jump_url,
+            "channel_name": msg.channel_name,
+            "thread_name": msg.thread_name,
             "category": msg.category,
             "rater_user_id": msg.rater_user_id,
             "rating_id": msg.rating_id,
@@ -917,6 +1030,8 @@ def load_state_from_file(filepath: str = "bootstrap_state.json"):
             timestamp=msg_data["timestamp"],
             flagged_at=msg_data["flagged_at"],
             jump_url=msg_data["jump_url"],
+            channel_name=msg_data.get("channel_name"),
+            thread_name=msg_data.get("thread_name"),
             category=msg_data["category"],
             rater_user_id=msg_data["rater_user_id"],
             rating_id=msg_data["rating_id"],
@@ -973,11 +1088,14 @@ async def repl():
             
             max_concurrent_input = input("Max concurrent API calls (default: 5): ").strip()
             max_concurrent = int(max_concurrent_input) if max_concurrent_input.isdigit() else 5
+            collapse_input = input("Collapse categories for training? (y/N): ").strip().lower()
+            collapse_categories = collapse_input in {"y", "yes"}
             
             await run_full_pipeline(
                 max_concurrent=max_concurrent,
                 provider=provider,
-                openrouter_model=openrouter_model
+                openrouter_model=openrouter_model,
+                collapse_categories=collapse_categories
             )
             
         elif choice == "2":
@@ -1045,11 +1163,15 @@ async def repl():
             model_choice = input("Enter choice (1-2): ").strip()
             state.model_type = "mlp" if model_choice == "2" else "lightgbm"
             
-            # Prepare data if not already done
-            if state.X_train is None:
-                state.X_train, state.X_test, state.y_train, state.y_test = prepare_training_data(
-                    state.messages_with_features
-                )
+            collapse_input = input("Collapse categories for training? (y/N): ").strip().lower()
+            collapse_categories = collapse_input in {"y", "yes"}
+            state.collapse_categories = collapse_categories
+            
+            # Always prepare data with the selected category handling
+            state.X_train, state.X_test, state.y_train, state.y_test = prepare_training_data(
+                state.messages_with_features,
+                collapse_categories=collapse_categories
+            )
             
             if state.X_train is not None and state.y_train is not None:
                 state.model = train_model(state.X_train, state.y_train, state.model_type)

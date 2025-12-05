@@ -22,6 +22,24 @@ openrouter_client = OpenAI(
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # JSON schema for structured output of candidate features
+def _strip_additional_properties(schema: Any) -> Any:
+    """
+    Recursively remove additionalProperties keys from a JSON schema.
+    
+    Gemini's response_schema rejects the additional_properties field, so we strip it
+    while keeping the stricter version for providers that support it.
+    """
+    if isinstance(schema, dict):
+        return {
+            key: _strip_additional_properties(value)
+            for key, value in schema.items()
+            if key != "additionalProperties"
+        }
+    if isinstance(schema, list):
+        return [_strip_additional_properties(item) for item in schema]
+    return schema
+
+
 CANDIDATE_FEATURES_SCHEMA = {
     "type": "object",
     "properties": {
@@ -70,6 +88,9 @@ CANDIDATE_FEATURES_SCHEMA = {
     "required": ["candidates"],
     "additionalProperties": False
 }
+
+# Gemini requires a schema without additionalProperties fields
+CANDIDATE_FEATURES_SCHEMA_GEMINI = _strip_additional_properties(CANDIDATE_FEATURES_SCHEMA)
 
 
 async def extract_features_from_formatted_history(
@@ -206,7 +227,7 @@ async def extract_features_from_formatted_history(
                 contents=user_prompt,
                 config=genai.types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    response_schema=CANDIDATE_FEATURES_SCHEMA,
+                    response_schema=CANDIDATE_FEATURES_SCHEMA_GEMINI,
                     thinking_config=genai.types.ThinkingConfig(thinking_budget=8192),
                     system_instruction=system_prompt
                 )

@@ -3,3 +3,4 @@ rating_system_log.json
 excelsior.db
 __pycache__/
 .env
+models/
