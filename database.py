@@ -148,3 +148,60 @@ class UserCoOccurrence(Base):
         ),
     )
 
+
+class FeatureExtractionRun(Base):
+    """
+    Groups a set of feature extractions together for versioning and tracking.
+    
+    Each run represents one execution of the feature extraction pipeline,
+    allowing multiple iterations without overwriting previous results.
+    """
+    __tablename__ = "feature_extraction_runs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=True)  # Optional user description
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+    provider = Column(String(50), nullable=False)  # gemini, openrouter, cerebras
+    model_name = Column(String(100), nullable=True)  # Model name for all providers
+    runs_per_message = Column(Integer, nullable=False, default=1)
+    message_count = Column(Integer, nullable=False, default=0)  # How many messages have features
+
+
+class MessageFeatures(Base):
+    """
+    Stores extracted LLM features for a single message.
+    
+    Features are stored as a JSON dict mapping feature names to float values.
+    Multiple rows per message are allowed when runs_per_message > 1 for
+    stochastic feature extraction.
+    """
+    __tablename__ = "message_features"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # Null during production when not part of a bootstrapping run
+    extraction_run_id = Column(
+        Integer,
+        ForeignKey("feature_extraction_runs.id"),
+        nullable=True,
+        index=True
+    )
+    message_id = Column(
+        BigInteger,
+        ForeignKey("flagged_messages.message_id"),
+        nullable=False,
+        index=True
+    )
+    run_index = Column(Integer, nullable=False, default=0)  # For multiple stochastic runs
+    features = Column(JSON, nullable=False)  # Feature dict mapping names to float values
+    target_username = Column(String(50), nullable=True)  # For stat feature refresh
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint(
+            "extraction_run_id",
+            "message_id",
+            "run_index",
+            name="uq_extraction_message_run",
+        ),
+    )
+

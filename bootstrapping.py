@@ -28,7 +28,13 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 
 from config import CHANNEL_ALLOW_LIST, DISCORD_BOT_TOKEN, HISTORY_PER_CHECK
-from database import FlaggedMessage, FlaggedMessageRating, RatingCategory
+from database import (
+    FlaggedMessage,
+    FlaggedMessageRating,
+    FeatureExtractionRun,
+    MessageFeatures,
+    RatingCategory,
+)
 from db_config import get_session, init_db
 from llms import extract_features_from_formatted_history
 from ml import FEATURE_NAMES, ModerationClassifier, create_classifier
@@ -535,6 +541,237 @@ def save_to_database(rated_messages: list[RatedMessage]) -> None:
         session.close()
 
 
+def save_features_to_db(
+    messages_with_features: list[RatedMessage],
+    provider: str,
+    model_name: str | None = None,
+    runs_per_message: int = 1,
+    run_name: str | None = None,
+) -> int:
+    """
+    Save extracted features to the database as a new extraction run.
+    
+    Creates a FeatureExtractionRun record and associated MessageFeatures records
+    for each message's feature vectors. Allows versioning by creating new rows
+    instead of overwriting existing data.
+    
+    Args:
+        messages_with_features: Messages with extracted feature dicts
+        provider: LLM provider used (gemini, openrouter, cerebras)
+        model_name: Model name used for extraction
+        runs_per_message: Number of stochastic runs per message
+        run_name: Optional descriptive name for this extraction run
+        
+    Returns:
+        The ID of the created FeatureExtractionRun record
+    """
+    logger.info(f"Saving features to database for {len(messages_with_features)} messages...")
+    
+    init_db()
+    session = get_session()
+    
+    try:
+        # Create the extraction run record
+        extraction_run = FeatureExtractionRun(
+            name=run_name,
+            provider=provider,
+            model_name=model_name,
+            runs_per_message=runs_per_message,
+            message_count=len(messages_with_features),
+        )
+        session.add(extraction_run)
+        session.flush()  # Get the ID before adding features
+        
+        run_id = extraction_run.id
+        feature_count = 0
+        
+        # Save each message's features
+        for msg in messages_with_features:
+            if msg.features is None:
+                continue
+            
+            # Handle both single dict and list of dicts for features
+            feature_list = msg.features if isinstance(msg.features, list) else [msg.features]
+            
+            for run_index, feature_dict in enumerate(feature_list):
+                # Extract target_username from features if present
+                target_username = feature_dict.get("target_username")
+                
+                # Create feature record
+                msg_features = MessageFeatures(
+                    extraction_run_id=run_id,
+                    message_id=msg.message_id,
+                    run_index=run_index,
+                    features=feature_dict,
+                    target_username=target_username if isinstance(target_username, str) else None,
+                )
+                session.add(msg_features)
+                feature_count += 1
+        
+        session.commit()
+        logger.info(
+            f"Features saved: run_id={run_id}, {feature_count} feature vectors "
+            f"for {len(messages_with_features)} messages"
+        )
+        return run_id
+        
+    except Exception as e:
+        logger.error(f"Error saving features to database: {e}")
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def load_features_from_db(
+    extraction_run_id: int,
+    rated_messages: list[RatedMessage] | None = None,
+) -> list[RatedMessage]:
+    """
+    Load extracted features from the database for a specific extraction run.
+    
+    If rated_messages is provided, populates their features field from the DB.
+    Otherwise, reconstructs RatedMessage objects from FlaggedMessage + features.
+    
+    Args:
+        extraction_run_id: ID of the FeatureExtractionRun to load
+        rated_messages: Optional existing messages to populate with features
+        
+    Returns:
+        List of RatedMessage objects with features loaded from DB
+    """
+    logger.info(f"Loading features from database for run_id={extraction_run_id}...")
+    
+    init_db()
+    session = get_session()
+    
+    try:
+        # Verify the extraction run exists
+        extraction_run = session.query(FeatureExtractionRun).filter_by(
+            id=extraction_run_id
+        ).first()
+        
+        if extraction_run is None:
+            raise ValueError(f"Extraction run {extraction_run_id} not found")
+        
+        logger.info(
+            f"Loading run: {extraction_run.name or '(unnamed)'}, "
+            f"provider={extraction_run.provider}, "
+            f"created={extraction_run.created_at}"
+        )
+        
+        # Query all features for this run, grouped by message_id
+        feature_records = session.query(MessageFeatures).filter_by(
+            extraction_run_id=extraction_run_id
+        ).order_by(MessageFeatures.message_id, MessageFeatures.run_index).all()
+        
+        # Group features by message_id
+        features_by_message: dict[int, list[dict[str, float]]] = defaultdict(list)
+        for record in feature_records:
+            features_by_message[record.message_id].append(record.features)
+        
+        logger.info(f"Found features for {len(features_by_message)} messages")
+        
+        # If rated_messages provided, just populate their features
+        if rated_messages is not None:
+            populated_count = 0
+            for msg in rated_messages:
+                if msg.message_id in features_by_message:
+                    msg.features = features_by_message[msg.message_id]
+                    populated_count += 1
+            
+            logger.info(f"Populated features for {populated_count}/{len(rated_messages)} messages")
+            return [msg for msg in rated_messages if msg.features]
+        
+        # Otherwise, reconstruct RatedMessages from DB
+        messages_with_features: list[RatedMessage] = []
+        
+        for message_id, feature_list in features_by_message.items():
+            # Get the FlaggedMessage record
+            flagged_msg = session.query(FlaggedMessage).filter_by(
+                message_id=message_id
+            ).first()
+            
+            if flagged_msg is None:
+                logger.warning(f"FlaggedMessage {message_id} not found, skipping")
+                continue
+            
+            # Get the rating for this message
+            rating = session.query(FlaggedMessageRating).filter_by(
+                flagged_message_id=message_id
+            ).first()
+            
+            if rating is None:
+                logger.warning(f"No rating found for message {message_id}, skipping")
+                continue
+            
+            # Map rating category enum to string
+            category_str = rating.category.value if rating.category else "NA"
+            
+            rated_msg = RatedMessage(
+                message_id=flagged_msg.message_id,
+                channel_id=flagged_msg.channel_id,
+                guild_id=flagged_msg.guild_id,
+                author_id=flagged_msg.author_id,
+                author_name=flagged_msg.author_username or "",
+                content=flagged_msg.content,
+                timestamp=flagged_msg.timestamp.isoformat() if flagged_msg.timestamp else "",
+                flagged_at=flagged_msg.flagged_at.isoformat() if flagged_msg.flagged_at else "",
+                jump_url=f"https://discord.com/channels/{flagged_msg.guild_id}/{flagged_msg.channel_id}/{flagged_msg.message_id}",
+                category=category_str,
+                rater_user_id=rating.rater_user_id,
+                rating_id=rating.rating_id,
+                context_message_ids=flagged_msg.context_message_ids or [],
+                context_messages=flagged_msg.context_messages or [],
+                features=feature_list,
+            )
+            messages_with_features.append(rated_msg)
+        
+        logger.info(f"Loaded {len(messages_with_features)} messages with features from DB")
+        return messages_with_features
+        
+    except Exception as e:
+        logger.error(f"Error loading features from database: {e}")
+        raise
+    finally:
+        session.close()
+
+
+def list_extraction_runs() -> list[dict[str, Any]]:
+    """
+    List all available feature extraction runs from the database.
+    
+    Returns a list of dicts with run metadata for display and selection.
+    
+    Returns:
+        List of dicts containing run info (id, name, provider, model, date, message_count)
+    """
+    init_db()
+    session = get_session()
+    
+    try:
+        runs = session.query(FeatureExtractionRun).order_by(
+            FeatureExtractionRun.created_at.desc()
+        ).all()
+        
+        result = []
+        for run in runs:
+            result.append({
+                "id": run.id,
+                "name": run.name or "(unnamed)",
+                "provider": run.provider,
+                "model_name": run.model_name,
+                "runs_per_message": run.runs_per_message,
+                "message_count": run.message_count,
+                "created_at": run.created_at.strftime("%Y-%m-%d %H:%M:%S") if run.created_at else "unknown",
+            })
+        
+        return result
+        
+    finally:
+        session.close()
+
+
 # =============================================================================
 # STEP 3: Extract LLM Features
 # =============================================================================
@@ -544,8 +781,10 @@ async def extract_features(
     max_concurrent: int = 5,
     runs_per_message: int = 1,
     provider: str = "gemini",
-    openrouter_model: str = "openai/gpt-oss-120b"
-) -> list[RatedMessage]:
+    openrouter_model: str = "openai/gpt-oss-120b",
+    auto_save: bool = True,
+    run_name: str | None = None,
+) -> tuple[list[RatedMessage], int | None]:
     """
     Extract LLM features from message context using LLM API.
     
@@ -554,6 +793,9 @@ async def extract_features(
     configurable concurrency. When runs_per_message > 1, repeats extraction to collect
     multiple stochastic feature vectors per rated message.
     
+    Automatically saves extracted features to the database after completion
+    unless auto_save is False.
+    
     Args:
         rated_messages: List of rated messages with context
         max_concurrent: Maximum number of concurrent API calls
@@ -561,9 +803,11 @@ async def extract_features(
         provider: LLM provider to use ("gemini", "openrouter", or "cerebras")
         openrouter_model: Model to use when provider is "openrouter"
             (Gemini uses the default model configured in llms.py)
+        auto_save: Whether to automatically save features to database (default True)
+        run_name: Optional name for the extraction run (for DB record)
         
     Returns:
-        List of messages with features extracted
+        Tuple of (messages with features, extraction_run_id or None if auto_save=False)
     """
     logger.info(f"Extracting LLM features for {len(rated_messages)} messages...")
     logger.info(f"Provider: {provider}, Max concurrent: {max_concurrent}")
@@ -725,7 +969,20 @@ async def extract_features(
             messages_with_features.append(result)
     
     logger.info(f"Feature extraction complete: {len(messages_with_features)} successful, {error_count} errors")
-    return messages_with_features
+    
+    # Auto-save features to database
+    extraction_run_id: int | None = None
+    if auto_save and messages_with_features:
+        model_name = openrouter_model if provider == "openrouter" else None
+        extraction_run_id = save_features_to_db(
+            messages_with_features,
+            provider=provider,
+            model_name=model_name,
+            runs_per_message=runs_per_message,
+            run_name=run_name,
+        )
+    
+    return messages_with_features, extraction_run_id
 
 
 # =============================================================================
@@ -1165,9 +1422,10 @@ def print_menu():
     print("5. Train model (LightGBM, MLP, or logistic regression)")
     print("6. Evaluate model (on held-out test set)")
     print("7. Show current state")
-    print("8. Save/Load state to file")
+    print("8. Save/Load state to JSON file")
     print("9. Exit")
     print("10. Collect user statistics from Discord (channels & threads)")
+    print("11. List/Load features from database")
     print("=" * 50)
 
 
@@ -1238,13 +1496,16 @@ async def run_full_pipeline(
     save_to_database(state.messages_with_context)
     
     # Step 3: Extract features (Gemini by default, concurrent requests)
-    state.messages_with_features = await extract_features(
+    # Auto-saves to database and returns (messages, run_id)
+    state.messages_with_features, extraction_run_id = await extract_features(
         state.messages_with_context,
         max_concurrent=max_concurrent,
         runs_per_message=runs_per_message,
         provider=provider,
-        openrouter_model=openrouter_model
+        openrouter_model=openrouter_model,
     )
+    if extraction_run_id:
+        logger.info(f"Features saved to database with run_id={extraction_run_id}")
     if not state.messages_with_features:
         logger.error("No features extracted, aborting pipeline")
         return
@@ -1328,13 +1589,27 @@ def save_state_to_file(filepath: str = "bootstrap_state.json"):
     logger.info(f"State saved: {len(serializable_messages)} messages")
 
 
-def load_state_from_file(filepath: str = "bootstrap_state.json"):
-    """Load state from a JSON file."""
+def load_state_from_file(
+    filepath: str = "bootstrap_state.json",
+    save_to_db: bool = True,
+    run_name: str | None = None,
+) -> int | None:
+    """
+    Load state from a JSON file and optionally persist features to the database.
+    
+    Args:
+        filepath: Path to the JSON state file.
+        save_to_db: Whether to create a new DB extraction run with the loaded features.
+        run_name: Optional name for the extraction run when saving to DB.
+        
+    Returns:
+        Extraction run ID if features were saved to DB, otherwise None.
+    """
     logger.info(f"Loading state from {filepath}...")
     
     if not Path(filepath).exists():
         logger.error(f"State file not found: {filepath}")
-        return
+        return None
     
     with open(filepath, "r", encoding="utf-8") as f:
         state_data = json.load(f)
@@ -1384,6 +1659,25 @@ def load_state_from_file(filepath: str = "bootstrap_state.json"):
     logger.info(f"State loaded: {len(messages)} messages")
     logger.info(f"  With context: {len(state.messages_with_context)}")
     logger.info(f"  With features: {len(state.messages_with_features)}")
+    
+    extraction_run_id: int | None = None
+    if save_to_db and state.messages_with_features:
+        # Infer runs_per_message from loaded data (max length across messages)
+        runs_per_message = max(len(m.features or []) for m in state.messages_with_features) or 1
+        inferred_run_name = run_name or f"imported_from_{Path(filepath).name}"
+        extraction_run_id = save_features_to_db(
+            state.messages_with_features,
+            provider="imported",
+            model_name=None,
+            runs_per_message=runs_per_message,
+            run_name=inferred_run_name,
+        )
+        logger.info(
+            "Saved loaded features to database "
+            f"(run_id={extraction_run_id}, messages={len(state.messages_with_features)})"
+        )
+    
+    return extraction_run_id
 
 
 async def repl():
@@ -1499,15 +1793,20 @@ async def repl():
             max_concurrent = int(max_concurrent_input) if max_concurrent_input.isdigit() else 5
             runs_input = input("Feature extraction runs per message (default: 1): ").strip()
             runs_per_message = int(runs_input) if runs_input.isdigit() else 1
+            run_name_input = input("Name for this extraction run (optional): ").strip()
+            run_name = run_name_input if run_name_input else None
             
-            state.messages_with_features = await extract_features(
+            state.messages_with_features, extraction_run_id = await extract_features(
                 messages,
                 max_concurrent=max_concurrent,
                 runs_per_message=runs_per_message,
                 provider=provider,
-                openrouter_model=openrouter_model
+                openrouter_model=openrouter_model,
+                run_name=run_name,
             )
             print(f"Extracted features for {len(state.messages_with_features)} messages")
+            if extraction_run_id:
+                print(f"Features saved to database with run_id={extraction_run_id}")
             
         elif choice == "5":
             # Train model
@@ -1613,7 +1912,9 @@ async def repl():
                 save_state_to_file(filepath or "bootstrap_state.json")
             elif sl_choice == "2":
                 filepath = input("Enter filename (default: bootstrap_state.json): ").strip()
-                load_state_from_file(filepath or "bootstrap_state.json")
+                run_id = load_state_from_file(filepath or "bootstrap_state.json")
+                if run_id:
+                    print(f"Features saved to database from imported state (run_id={run_id})")
             
         elif choice == "9":
             print("Exiting...")
@@ -1642,9 +1943,43 @@ async def repl():
                 f"Messages: {summary['messages_processed']}, "
                 f"Windows updated: {summary['windows_processed']}"
             )
+        
+        elif choice == "11":
+            # List/Load features from database
+            print("\n--- Feature Extraction Runs in Database ---")
+            runs = list_extraction_runs()
+            
+            if not runs:
+                print("No extraction runs found in database.")
+                continue
+            
+            # Display available runs
+            print(f"{'ID':<5} {'Name':<25} {'Provider':<12} {'Messages':<10} {'Created':<20}")
+            print("-" * 75)
+            for run in runs:
+                print(
+                    f"{run['id']:<5} {run['name'][:24]:<25} {run['provider']:<12} "
+                    f"{run['message_count']:<10} {run['created_at']:<20}"
+                )
+            print()
+            
+            # Ask if user wants to load a run
+            load_choice = input("Enter run ID to load (or press Enter to cancel): ").strip()
+            if load_choice.isdigit():
+                run_id = int(load_choice)
+                try:
+                    state.messages_with_features = load_features_from_db(run_id)
+                    # Also populate other state lists for consistency
+                    state.messages_with_context = state.messages_with_features
+                    state.rated_messages = state.messages_with_features
+                    print(f"Loaded {len(state.messages_with_features)} messages with features from run {run_id}")
+                except ValueError as e:
+                    print(f"Error: {e}")
+            else:
+                print("Load cancelled.")
             
         else:
-            print("Invalid choice. Please enter 1-9.")
+            print("Invalid choice. Please enter 1-11.")
 
 
 def main():

@@ -194,7 +194,7 @@ async def extract_features_from_formatted_history(
     4. Output a JSON object matching the provided schema with all candidates and their features.
 
     ### Features (all float values between 0 and 1):
-    - "discusses_ellie": The degree to which "Ellie" is a significant topic of discussion in the message history provided. This is unrelated to other features, and is a one-off.
+    - "discusses_ellie": The degree to which "Ellie" is a significant topic of discussion in the message history provided. Ellie's @ mention is "<@1333546604694732892>," which also counts.
     - "familiarity_score": How familiar the author of the candidate message seems to be with the target user.
     - "tone_harshness_score": Overall harshness/condescension level independent of content.
     - "positive_framing_score": Does it use positive language ("I like X", "consider trying Y") vs negative ("X is wrong", "your layout is unoptimal")?
@@ -204,7 +204,7 @@ async def extract_features_from_formatted_history(
     - "context_is_feedback_appropriate": Is this a role request, classroom post, module post, etc. where feedback is expected?
     - "target_uncomfortableness_score": How uncomfortable the target user seems to be with the candidate message. This could be trying to defend themselves or their position, sad emoji, etc.
     - "is_part_of_discussion": Whether the candidate message is part of a two-way discussion about a specific topic in which both the author and target user are engaged.
-    - "criticism_directed_at_image": The degree to which the candidate message could be criticizing a specific posted image/attachment.
+    - "criticism_directed_at_image": The degree to which the candidate message could be directed at a specific posted image/attachment.
     - "criticism_directed_at_statement": The degree to which the candidate message could be criticizing a specific statement or idea made by the target user.
     - "criticism_directed_at_generality": The degree to which the candidate message could be criticizing a general topic or concept not specific to the target user, such as the game itself or the server.
     - "reciprocity_score": The degree to which the candidate message could be criticizing a negative behavior of the target user themselves, such as being rude, disrespectful, etc. This includes scolding people for giving bad feedback, being too harsh, etc.
