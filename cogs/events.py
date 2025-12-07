@@ -5,6 +5,12 @@ from discord.ext import commands
 from bot import ExcelsiorBot
 from history import MessageStore
 from utils import is_tracked_channel
+from user_stats import (
+    DEFAULT_WINDOW_SIZE,
+    ensure_user_stats_schema,
+    update_co_occurrences_from_window,
+    update_user_stats_from_message,
+)
 
 
 class Events(commands.Cog):
@@ -15,6 +21,8 @@ class Events(commands.Cog):
         # Access to global message store and DB connection
         self.message_store: MessageStore = bot.message_store
         self.get_db_session = bot.get_db_session
+        # Ensure schema is migrated before realtime updates
+        ensure_user_stats_schema()
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -33,6 +41,16 @@ class Events(commands.Cog):
             return
         
         self.message_store.add_message(message)
+
+        session = self.get_db_session()
+        try:
+            update_user_stats_from_message(message, session)
+            recent_history = self.message_store.get_whole_history(message.channel.id)
+            window = recent_history[-DEFAULT_WINDOW_SIZE :]
+            update_co_occurrences_from_window(window, session)
+            session.commit()
+        finally:
+            session.close()
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):

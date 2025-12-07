@@ -34,6 +34,9 @@ FEATURE_NAMES = [
     "criticism_directed_at_generality",
     "reciprocity_score",
     "solicited_score",
+    "seniority_score_messages",
+    "seniority_score_characters",
+    "familiarity_score_stat",
 ]
 
 
@@ -43,6 +46,8 @@ class ModerationClassifier(ABC):
     def __init__(self):
         self.label_encoder = LabelEncoder()
         self.is_fitted = False
+        # Track the feature ordering used to fit the model
+        self.feature_names: list[str] = FEATURE_NAMES.copy()
 
     @abstractmethod
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
@@ -95,6 +100,7 @@ class ModerationClassifier(ABC):
         model_data = self._get_model_data()
         model_data["label_encoder"] = self.label_encoder
         model_data["is_fitted"] = self.is_fitted
+        model_data["feature_names"] = getattr(self, "feature_names", FEATURE_NAMES)
         
         joblib.dump(model_data, path)
         logger.info(f"Model saved to {path}")
@@ -116,6 +122,7 @@ class ModerationClassifier(ABC):
         instance = cls()
         instance.label_encoder = model_data["label_encoder"]
         instance.is_fitted = model_data["is_fitted"]
+        instance.feature_names = model_data.get("feature_names", FEATURE_NAMES)
         instance._set_model_data(model_data)
         
         logger.info(f"Model loaded from {path}")
@@ -249,8 +256,9 @@ class LightGBMClassifier(ModerationClassifier):
         importances = self.model.feature_importances_
         # Normalize to sum to 1
         importances = importances / importances.sum()
+        feature_names = getattr(self, "feature_names", FEATURE_NAMES)
         
-        return dict(zip(FEATURE_NAMES, importances))
+        return dict(zip(feature_names, importances))
 
 
 class LogisticRegressionClassifier(ModerationClassifier):
@@ -378,8 +386,9 @@ class LogisticRegressionClassifier(ModerationClassifier):
             normalized_importances = np.zeros_like(importances)
         else:
             normalized_importances = importances / importance_sum
+        feature_names = getattr(self, "feature_names", FEATURE_NAMES)
 
-        return dict(zip(FEATURE_NAMES, normalized_importances))
+        return dict(zip(feature_names, normalized_importances))
 
 
 class MLPModerationClassifier(ModerationClassifier):
@@ -497,8 +506,9 @@ class MLPModerationClassifier(ModerationClassifier):
         importances = first_layer_weights.sum(axis=1)
         # Normalize to sum to 1
         importances = importances / importances.sum()
+        feature_names = getattr(self, "feature_names", FEATURE_NAMES)
         
-        return dict(zip(FEATURE_NAMES, importances))
+        return dict(zip(feature_names, importances))
 
 
 def create_classifier(model_type: str = "lightgbm", **kwargs) -> ModerationClassifier:

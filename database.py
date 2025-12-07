@@ -1,8 +1,6 @@
 """SQLAlchemy ORM models for the Discord moderation bot."""
 
 from datetime import datetime, timezone
-from typing import Optional
-
 from sqlalchemy import (
     Column,
     Integer,
@@ -13,6 +11,7 @@ from sqlalchemy import (
     ForeignKey,
     JSON,
     Enum as SQLEnum,
+    UniqueConstraint,
 )
 import enum
 
@@ -120,6 +119,7 @@ class UserStats(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, unique=True, nullable=False, index=True)
     username = Column(String(50), nullable=False)
+    display_name = Column(String(100), nullable=True)
     
     # When the user joined the server
     join_timestamp = Column(DateTime, nullable=True)
@@ -127,4 +127,24 @@ class UserStats(Base):
     # Activity metrics
     message_count = Column(Integer, nullable=False, default=0)
     character_count = Column(Integer, nullable=False, default=0)
+
+
+class UserCoOccurrence(Base):
+    """
+    Stores co-occurrence counts for user pairs seen within rolling conversations.
+    """
+    __tablename__ = "user_co_occurrences"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_a_id = Column(BigInteger, nullable=False, index=True)
+    user_b_id = Column(BigInteger, nullable=False, index=True)
+    co_occurrence_count = Column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_a_id",
+            "user_b_id",
+            name="uq_user_co_occurrence_pair",
+        ),
+    )
 

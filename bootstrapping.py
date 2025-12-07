@@ -27,11 +27,19 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split
 
-from config import DISCORD_BOT_TOKEN, HISTORY_PER_CHECK
+from config import CHANNEL_ALLOW_LIST, DISCORD_BOT_TOKEN, HISTORY_PER_CHECK
 from database import FlaggedMessage, FlaggedMessageRating, RatingCategory
 from db_config import get_session, init_db
 from llms import extract_features_from_formatted_history
 from ml import FEATURE_NAMES, ModerationClassifier, create_classifier
+from user_stats import (
+    bootstrap_user_stats,
+    build_author_id_map,
+    build_username_to_id_map,
+    ensure_user_stats_schema,
+    get_familiarity_score_stat,
+    get_seniority_scores,
+)
 
 # Configure logging with timestamps and level
 logging.basicConfig(
@@ -84,10 +92,18 @@ class BootstrapState:
     model_type: str = "lightgbm"
     collapse_categories: bool = False
     collapse_ambiguous_to_no_flag: bool = False
+    active_feature_names: list[str] = field(default_factory=lambda: FEATURE_NAMES.copy())
+    ignored_features: set[str] = field(default_factory=set)
 
 
 # Global state for the REPL
 state = BootstrapState()
+
+
+def ensure_user_stats_ready() -> None:
+    """Ensure user stats tables exist before stat-based feature lookups."""
+    init_db()
+    ensure_user_stats_schema()
 
 
 def extract_channel_thread_from_context(
@@ -555,6 +571,9 @@ async def extract_features(
     if provider == "openrouter":
         logger.info(f"OpenRouter model: {openrouter_model}")
     
+    # Ensure stats tables are present so stat features can be populated
+    ensure_user_stats_ready()
+    
     # Filter messages that have context
     messages_to_process = [m for m in rated_messages if m.context_messages]
     skipped = len(rated_messages) - len(messages_to_process)
@@ -619,6 +638,18 @@ async def extract_features(
                 # Determine the flagged message's relative ID so we can require it
                 flagged_rel_id = message_id_to_rel_id.get(rated_msg.message_id)
                 required_indexes = [flagged_rel_id] if flagged_rel_id else None
+                message_id_to_author = {
+                    str(ctx_msg["id"]): ctx_msg["author_id"]
+                    for ctx_msg in rated_msg.context_messages
+                    if isinstance(ctx_msg.get("author_id"), int)
+                }
+                rel_id_to_author = {
+                    rel_id: ctx_msg["author_id"]
+                    for rel_id, ctx_msg in enumerate(rated_msg.context_messages, start=1)
+                    if isinstance(ctx_msg.get("author_id"), int)
+                }
+                author_id_map = build_author_id_map(message_id_to_author, rel_id_to_author)
+                username_id_map = build_username_to_id_map(rated_msg.context_messages)
                 
                 # Call LLM to extract features with channel/thread context
                 channel_name, thread_name = resolve_channel_context(rated_msg)
@@ -631,7 +662,10 @@ async def extract_features(
                         thread_name,
                         provider=provider,  # type: ignore[arg-type]
                         openrouter_model=openrouter_model,
-                        required_message_indexes=required_indexes
+                        required_message_indexes=required_indexes,
+                        author_id_map=author_id_map,
+                        username_id_map=username_id_map,
+                        stats_session_factory=get_session,
                     )
                     
                     # Find features for the flagged message in this run
@@ -639,11 +673,13 @@ async def extract_features(
                     
                     features_found = False
                     selected_features: dict[str, float] = {}
+                    target_username: str | None = None
                     for candidate in candidates:
                         # Match by message_id or relative_id
                         if (candidate.get("message_id") == flagged_msg_id_str or 
                             candidate.get("message_id") == str(flagged_rel_id)):
                             selected_features = candidate.get("features", {})
+                            target_username = candidate.get("target_username")
                             features_found = True
                             break
                     
@@ -653,6 +689,10 @@ async def extract_features(
                             f"LLM did not identify message {rated_msg.message_id} as candidate on run {run_idx + 1}, using zero features"
                         )
                         selected_features = {name: 0.0 for name in FEATURE_NAMES}
+                    
+                    # Store target_username in features for later stat refreshes
+                    if target_username:
+                        selected_features["target_username"] = target_username  # type: ignore[assignment]
                     
                     feature_runs.append(selected_features)
                 
@@ -715,12 +755,132 @@ def collapse_category_label(
     return category
 
 
+def refresh_stat_features(messages_with_features: list[RatedMessage]) -> None:
+    """
+    Refresh seniority and familiarity stats from the database for all messages.
+    
+    Updates the stat-based features (seniority_score_messages, seniority_score_characters,
+    familiarity_score_stat) in-place using the current user_stats and user_co_occurrences tables.
+    This allows training to use freshly collected stats without re-running LLM feature extraction.
+    """
+    ensure_user_stats_ready()
+    session = get_session()
+    updated_count = 0
+    missing_target_count = 0
+    missing_author_count = 0
+    total_vectors = 0
+    
+    try:
+        for rated_msg in messages_with_features:
+            if rated_msg.features is None or not rated_msg.context_messages:
+                continue
+            
+            # Build username-to-ID mapping from context messages
+            username_id_map = build_username_to_id_map(rated_msg.context_messages)
+            
+            # Build author ID map from context messages
+            rel_id_to_author = {
+                rel_id: ctx_msg["author_id"]
+                for rel_id, ctx_msg in enumerate(rated_msg.context_messages, start=1)
+                if isinstance(ctx_msg.get("author_id"), int)
+            }
+            message_id_to_author = {
+                str(ctx_msg["id"]): ctx_msg["author_id"]
+                for ctx_msg in rated_msg.context_messages
+                if isinstance(ctx_msg.get("author_id"), int)
+            }
+            author_id_map = build_author_id_map(message_id_to_author, rel_id_to_author)
+            
+            # Find the flagged message's relative ID
+            flagged_rel_id = None
+            for rel_id, ctx_msg in enumerate(rated_msg.context_messages, start=1):
+                if ctx_msg.get("id") == rated_msg.message_id:
+                    flagged_rel_id = rel_id
+                    break
+            
+            # Get author ID from the flagged message
+            author_id = author_id_map.get(str(rated_msg.message_id))
+            if author_id is None and flagged_rel_id is not None:
+                author_id = author_id_map.get(str(flagged_rel_id))
+            
+            # Update each feature payload
+            for feature_payload in rated_msg.features:
+                total_vectors += 1
+                
+                # Try to find target user from the stored target_username if available
+                target_username = feature_payload.get("target_username")
+                target_id = (
+                    username_id_map.get(target_username)  # type: ignore[arg-type]
+                    if isinstance(target_username, str)
+                    else None
+                )
+                
+                # Compute fresh stats if we have both author and target
+                if author_id is not None and target_id is not None:
+                    msg_score, char_score = get_seniority_scores(author_id, target_id, session)
+                    fam_score = get_familiarity_score_stat(author_id, target_id, session)
+                    feature_payload["seniority_score_messages"] = msg_score
+                    feature_payload["seniority_score_characters"] = char_score
+                    feature_payload["familiarity_score_stat"] = fam_score
+                    updated_count += 1
+                else:
+                    # Track why we couldn't update
+                    if author_id is None:
+                        missing_author_count += 1
+                    elif target_id is None:
+                        missing_target_count += 1
+                    
+                    # Ensure keys exist with default values
+                    feature_payload.setdefault("seniority_score_messages", 0.0)
+                    feature_payload.setdefault("seniority_score_characters", 0.0)
+                    feature_payload.setdefault("familiarity_score_stat", 0.0)
+    finally:
+        session.close()
+    
+    logger.info(f"Refreshed stat features for {updated_count}/{total_vectors} feature vectors")
+    if missing_target_count > 0:
+        logger.warning(
+            f"  {missing_target_count} vectors missing target_username (re-extract features to fix)"
+        )
+    if missing_author_count > 0:
+        logger.warning(f"  {missing_author_count} vectors missing author_id")
+
+
+def build_feature_subset(
+    ignored_features: set[str] | None = None,
+    available_features: list[str] | None = None
+) -> tuple[list[str], list[str], list[str]]:
+    """
+    Compute active features after applying an ignore list.
+    
+    Args:
+        ignored_features: Feature names to exclude from training
+        available_features: Baseline ordered feature list (defaults to FEATURE_NAMES)
+        
+    Returns:
+        Tuple of (active_features, applied_ignored, invalid_requested)
+    """
+    base_features = available_features or FEATURE_NAMES
+    ignored_set = {feat.strip() for feat in ignored_features} if ignored_features else set()
+    invalid_requested = sorted(ignored_set - set(base_features))
+    applied_ignored = sorted(ignored_set & set(base_features))
+    active_features = [feat for feat in base_features if feat not in applied_ignored]
+    
+    if not active_features:
+        raise ValueError("At least one feature must remain active for training")
+    
+    return active_features, applied_ignored, invalid_requested
+
+
 def prepare_training_data(
     messages_with_features: list[RatedMessage],
     test_size: float = 0.2,
     random_state: int = 42,
     collapse_categories: bool = False,
-    collapse_ambiguous_to_no_flag: bool = False
+    collapse_ambiguous_to_no_flag: bool = False,
+    refresh_stats: bool = True,
+    active_feature_names: list[str] | None = None,
+    ignored_features: set[str] | None = None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Prepare feature matrices and labels for training.
@@ -731,11 +891,46 @@ def prepare_training_data(
         random_state: Random seed for reproducibility
         collapse_categories: Whether to merge rating categories into broader buckets
         collapse_ambiguous_to_no_flag: Whether to map ambiguous to no-flag when collapsing
+        refresh_stats: Whether to refresh seniority/familiarity stats from the database
+        active_feature_names: Ordered feature list to include (defaults to FEATURE_NAMES)
+        ignored_features: Feature names to drop (ignored if active_feature_names supplied)
         
     Returns:
         Tuple of (X_train, X_test, y_train, y_test)
     """
     logger.info(f"Preparing training data from {len(messages_with_features)} messages...")
+    
+    # Refresh stat features from database if requested
+    if refresh_stats:
+        refresh_stat_features(messages_with_features)
+    
+    applied_ignored: list[str] = []
+    invalid_requested: list[str] = []
+    
+    if active_feature_names is not None:
+        # Validate provided active feature list
+        invalid_requested = [feat for feat in active_feature_names if feat not in FEATURE_NAMES]
+        if invalid_requested:
+            logger.warning("Dropping unknown feature(s) from active list: %s", ", ".join(invalid_requested))
+        active_feature_names = [feat for feat in active_feature_names if feat in FEATURE_NAMES]
+        applied_ignored = sorted(ignored_features) if ignored_features else []
+        if not active_feature_names:
+            raise ValueError("Active feature list is empty after validation")
+    else:
+        try:
+            # Determine which features will be used for vector construction
+            active_feature_names, applied_ignored, invalid_requested = build_feature_subset(
+                ignored_features=ignored_features,
+                available_features=FEATURE_NAMES,
+            )
+        except ValueError as exc:
+            logger.error(str(exc))
+            raise
+    
+    if applied_ignored:
+        logger.info("Ignoring %d feature(s): %s", len(applied_ignored), ", ".join(applied_ignored))
+    if invalid_requested:
+        logger.warning("Requested invalid feature(s): %s", ", ".join(invalid_requested))
     
     def filter_discusses_ellie_messages(
         messages: list[RatedMessage],
@@ -794,7 +989,7 @@ def prepare_training_data(
         
         for feature_payload in feature_payloads:
             # Extract features in consistent order
-            feature_vector = [feature_payload.get(name, 0.0) for name in FEATURE_NAMES]
+            feature_vector = [feature_payload.get(name, 0.0) for name in active_feature_names]
             X.append(feature_vector)
             
             label = msg.category
@@ -809,7 +1004,12 @@ def prepare_training_data(
     X = np.array(X)
     y = np.array(y)
     
-    logger.info(f"Feature matrix shape: {X.shape} built from {total_feature_vectors} feature vectors")
+    logger.info(
+        "Feature matrix shape: %s built from %d feature vectors using %d features",
+        X.shape,
+        total_feature_vectors,
+        len(active_feature_names),
+    )
     label_distribution = dict(zip(*np.unique(y, return_counts=True)))
     distribution_label = "collapsed label distribution" if collapse_categories else "label distribution"
     logger.info(f"{distribution_label}: {label_distribution}")
@@ -828,7 +1028,8 @@ def prepare_training_data(
 def train_model(
     X_train: np.ndarray,
     y_train: np.ndarray,
-    model_type: str = "lightgbm"
+    model_type: str = "lightgbm",
+    feature_names: list[str] | None = None
 ) -> ModerationClassifier:
     """
     Train a classifier on the training data.
@@ -837,13 +1038,21 @@ def train_model(
         X_train: Training feature matrix
         y_train: Training labels
         model_type: Type of model to train ('lightgbm', 'mlp', or 'logistic')
+        feature_names: Ordered feature names used for training
         
     Returns:
         Trained classifier
     """
-    logger.info(f"Training {model_type} model...")
+    logger.info(
+        "Training %s model with %d features...",
+        model_type,
+        len(feature_names or FEATURE_NAMES),
+    )
     
     model = create_classifier(model_type)
+    # Attach active feature names for downstream importance reporting
+    if feature_names:
+        model.feature_names = feature_names  # type: ignore[attr-defined]
     model.fit(X_train, y_train)
     
     # Save model
@@ -958,6 +1167,7 @@ def print_menu():
     print("7. Show current state")
     print("8. Save/Load state to file")
     print("9. Exit")
+    print("10. Collect user statistics from Discord (channels & threads)")
     print("=" * 50)
 
 
@@ -979,6 +1189,12 @@ def print_state():
     print(f"Collapse categories: {state.collapse_categories}")
     if state.collapse_categories:
         print(f"  Collapse ambiguous to no-flag: {state.collapse_ambiguous_to_no_flag}")
+    print(
+        f"Active features: {len(state.active_feature_names)} "
+        f"(ignored: {len(state.ignored_features)})"
+    )
+    if state.ignored_features:
+        print(f"  Ignored features: {', '.join(sorted(state.ignored_features))}")
     print("---")
 
 
@@ -1002,6 +1218,9 @@ async def run_full_pipeline(
         collapse_ambiguous_to_no_flag: Whether to map ambiguous to no-flag when collapsing
     """
     logger.info("Starting full bootstrapping pipeline...")
+    # Full pipeline always starts with all features unless overridden later
+    state.ignored_features = set()
+    state.active_feature_names = FEATURE_NAMES.copy()
     
     # Step 1: Load data
     state.rated_messages = load_rating_data()
@@ -1035,7 +1254,9 @@ async def run_full_pipeline(
     X_train, X_test, y_train, y_test = prepare_training_data(
         state.messages_with_features,
         collapse_categories=collapse_categories,
-        collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag
+        collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag,
+        active_feature_names=state.active_feature_names,
+        ignored_features=state.ignored_features
     )
     state.X_train = X_train
     state.X_test = X_test
@@ -1049,7 +1270,12 @@ async def run_full_pipeline(
             collapse_ambiguous_to_no_flag
         )
     
-    state.model = train_model(X_train, y_train, state.model_type)
+    state.model = train_model(
+        X_train,
+        y_train,
+        state.model_type,
+        feature_names=state.active_feature_names,
+    )
     
     # Step 5: Evaluate
     evaluate_model(state.model, X_test, y_test)
@@ -1092,6 +1318,8 @@ def save_state_to_file(filepath: str = "bootstrap_state.json"):
         "model_type": state.model_type,
         "collapse_categories": state.collapse_categories,
         "collapse_ambiguous_to_no_flag": state.collapse_ambiguous_to_no_flag,
+        "active_feature_names": state.active_feature_names,
+        "ignored_features": sorted(state.ignored_features),
     }
     
     with open(filepath, "w", encoding="utf-8") as f:
@@ -1150,6 +1378,8 @@ def load_state_from_file(filepath: str = "bootstrap_state.json"):
     state.model_type = state_data.get("model_type", "lightgbm")
     state.collapse_categories = state_data.get("collapse_categories", False)
     state.collapse_ambiguous_to_no_flag = state_data.get("collapse_ambiguous_to_no_flag", False)
+    state.active_feature_names = state_data.get("active_feature_names", FEATURE_NAMES)
+    state.ignored_features = set(state_data.get("ignored_features", []))
     
     logger.info(f"State loaded: {len(messages)} messages")
     logger.info(f"  With context: {len(state.messages_with_context)}")
@@ -1309,15 +1539,54 @@ async def repl():
                 collapse_ambiguous_to_no_flag = collapse_ambiguous_input in {"y", "yes"}
             state.collapse_ambiguous_to_no_flag = collapse_ambiguous_to_no_flag
             
+            # Prompt for feature subset
+            print("\nAvailable features:")
+            print(", ".join(FEATURE_NAMES))
+            ignore_input = input(
+                "Features to ignore for training (comma-separated, blank for none): "
+            ).strip()
+            requested_ignored = {
+                feat.strip() for feat in ignore_input.split(",") if feat.strip()
+            } if ignore_input else set()
+            
+            try:
+                active_feature_names, applied_ignored, invalid_requested = build_feature_subset(
+                    ignored_features=requested_ignored,
+                    available_features=FEATURE_NAMES,
+                )
+            except ValueError:
+                print("Cannot ignore all features. Using all features instead.")
+                active_feature_names, applied_ignored, invalid_requested = build_feature_subset(
+                    ignored_features=set(),
+                    available_features=FEATURE_NAMES,
+                )
+            
+            state.ignored_features = set(applied_ignored)
+            state.active_feature_names = active_feature_names
+            
+            if invalid_requested:
+                print(f"Unknown feature names skipped: {', '.join(invalid_requested)}")
+            if state.ignored_features:
+                print(f"Ignoring features: {', '.join(sorted(state.ignored_features))}")
+            else:
+                print("Using all features for training.")
+            
             # Always prepare data with the selected category handling
             state.X_train, state.X_test, state.y_train, state.y_test = prepare_training_data(
                 state.messages_with_features,
                 collapse_categories=collapse_categories,
-                collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag
+                collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag,
+                active_feature_names=state.active_feature_names,
+                ignored_features=state.ignored_features
             )
             
             if state.X_train is not None and state.y_train is not None:
-                state.model = train_model(state.X_train, state.y_train, state.model_type)
+                state.model = train_model(
+                    state.X_train,
+                    state.y_train,
+                    state.model_type,
+                    feature_names=state.active_feature_names,
+                )
                 print(f"Model trained: {state.model_type}")
             else:
                 print("Training data not prepared. Run option 4 first.")
@@ -1349,6 +1618,30 @@ async def repl():
         elif choice == "9":
             print("Exiting...")
             break
+        elif choice == "10":
+            print("\nCollecting user statistics from tracked channels.")
+            print("This will fetch up to ~10000 messages per channel and update the stats tables.")
+            limit_input = input("Max messages per channel (default 10000): ").strip()
+            window_input = input("Rolling window size for co-occurrence (default 30): ").strip()
+            limit = int(limit_input) if limit_input.isdigit() else 10_000
+            window_size = int(window_input) if window_input.isdigit() else 30
+
+            def _log_progress(msg: str) -> None:
+                print(msg)
+
+            summary = await bootstrap_user_stats(
+                limit_per_channel=limit,
+                window_size=window_size,
+                # Only collect stats from explicitly allowed channels
+                channel_ids=CHANNEL_ALLOW_LIST,
+                progress_callback=_log_progress,
+            )
+            print(
+                f"User stats collection complete. "
+                f"Channels: {summary['channels_processed']}, "
+                f"Messages: {summary['messages_processed']}, "
+                f"Windows updated: {summary['windows_processed']}"
+            )
             
         else:
             print("Invalid choice. Please enter 1-9.")

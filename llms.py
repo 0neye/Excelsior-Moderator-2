@@ -1,13 +1,15 @@
 import asyncio
 import json
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from cerebras.cloud.sdk import Cerebras
 from google import genai
 from openai import OpenAI
 
 from config import CEREBRAS_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY
+from db_config import get_session
 from history import MessageStore
+from user_stats import get_familiarity_score_stat, get_seniority_scores
 from utils import format_message_history
 
 cerebras_client = Cerebras(api_key=CEREBRAS_API_KEY)
@@ -67,15 +69,18 @@ CANDIDATE_FEATURES_SCHEMA = {
                             "criticism_directed_at_statement": {"type": "number"},
                             "criticism_directed_at_generality": {"type": "number"},
                             "reciprocity_score": {"type": "number"},
-                            "solicited_score": {"type": "number"}
+                    "solicited_score": {"type": "number"},
+                    "seniority_score_messages": {"type": "number"},
+                    "seniority_score_characters": {"type": "number"},
+                    "familiarity_score_stat": {"type": "number"},
                         },
                         "required": [
                             "discusses_ellie", "familiarity_score", "tone_harshness_score",
                             "positive_framing_score", "includes_positive_takeaways", "explains_why_score",
                             "actionable_suggestion_score", "context_is_feedback_appropriate",
                             "target_uncomfortableness_score", "is_part_of_discussion",
-                            "criticism_directed_at_image", "criticism_directed_at_statement",
-                            "criticism_directed_at_generality", "reciprocity_score", "solicited_score"
+                    "criticism_directed_at_image", "criticism_directed_at_statement",
+                    "criticism_directed_at_generality", "reciprocity_score", "solicited_score"
                         ],
                         "additionalProperties": False
                     }
@@ -100,7 +105,10 @@ async def extract_features_from_formatted_history(
     provider: Literal["cerebras", "openrouter", "gemini"] = "cerebras",
     openrouter_model: str = "openai/gpt-oss-120b",
     gemini_model: str = "gemini-2.5-flash",
-    required_message_indexes: list[int] | None = None
+    required_message_indexes: list[int] | None = None,
+    author_id_map: dict[str, int] | None = None,
+    username_id_map: dict[str, int] | None = None,
+    stats_session_factory: Callable[[], Any] | None = None,
 ) -> list[dict]:
     """
     Extracts candidate features from formatted message history using LLM.
@@ -114,10 +122,55 @@ async def extract_features_from_formatted_history(
         gemini_model: The model to use when provider is "gemini"
         required_message_indexes: Optional list of relative message IDs that MUST have
             features extracted, regardless of whether they appear to be feedback candidates
+        author_id_map: Optional mapping of message_id/rel_id strings to author IDs for stat features
+        username_id_map: Optional mapping of usernames/display names to user IDs
+        stats_session_factory: Optional callable to create a DB session for stat lookups
     
     Returns:
         A list of candidate dicts, each containing message_id, target_username, and features.
     """
+
+    def _augment_stat_features(candidates: list[dict]) -> list[dict]:
+        """Attach seniority/familiarity stat features to candidates."""
+        if not stats_session_factory or not author_id_map:
+            # Ensure keys exist even without DB lookups
+            for candidate in candidates:
+                features = candidate.get("features", {})
+                features.setdefault("seniority_score_messages", 0.0)
+                features.setdefault("seniority_score_characters", 0.0)
+                features.setdefault("familiarity_score_stat", 0.0)
+                candidate["features"] = features
+            return candidates
+
+        session = stats_session_factory()
+        try:
+            for candidate in candidates:
+                features = candidate.get("features", {})
+                features.setdefault("seniority_score_messages", 0.0)
+                features.setdefault("seniority_score_characters", 0.0)
+                features.setdefault("familiarity_score_stat", 0.0)
+
+                message_id = candidate.get("message_id")
+                target_username = candidate.get("target_username")
+                author_id = author_id_map.get(str(message_id)) if message_id is not None else None
+                target_id = (
+                    username_id_map.get(target_username)
+                    if username_id_map and isinstance(target_username, str)
+                    else None
+                )
+
+                if author_id is not None and target_id is not None:
+                    msg_score, char_score = get_seniority_scores(author_id, target_id, session)
+                    fam_score = get_familiarity_score_stat(author_id, target_id, session)
+                    features["seniority_score_messages"] = msg_score
+                    features["seniority_score_characters"] = char_score
+                    features["familiarity_score_stat"] = fam_score
+
+                candidate["features"] = features
+        finally:
+            session.close()
+
+        return candidates
 
     # Build the required messages instruction if any are specified
     required_msg_instruction = ""
@@ -196,7 +249,6 @@ async def extract_features_from_formatted_history(
                 },
                 stream=False,
                 max_completion_tokens=65536,
-                reasoning_effort="medium"
             )
         )
     elif provider == "openrouter":
@@ -228,25 +280,27 @@ async def extract_features_from_formatted_history(
                 config=genai.types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=CANDIDATE_FEATURES_SCHEMA_GEMINI,
-                    thinking_config=genai.types.ThinkingConfig(thinking_budget=8192),
                     system_instruction=system_prompt
                 )
             )
         )
         
-        # Parse and return the Gemini response directly
+        # Parse the Gemini response directly
         gemini_content = gemini_response.text
         if gemini_content is None:
             raise ValueError("Gemini returned empty response")
         gemini_result: dict[str, Any] = json.loads(gemini_content)
-        return gemini_result["candidates"]
+        candidates = gemini_result["candidates"]
     else:
         raise ValueError(f"Unknown provider: {provider}")
-    
-    # Parse the structured JSON response
-    content: str = response.choices[0].message.content
-    result: dict[str, Any] = json.loads(content)
-    return result["candidates"]
+
+    if provider in {"cerebras", "openrouter"}:
+        # Parse the structured JSON response
+        content: str = response.choices[0].message.content
+        result: dict[str, Any] = json.loads(content)
+        candidates = result["candidates"]
+
+    return _augment_stat_features(candidates)
 
 
 async def get_candidate_features(
@@ -278,6 +332,14 @@ async def get_candidate_features(
     formatted_message_history_list = format_message_history(message_history, use_username=True, include_timestamp=True)
     formatted_message_history = "\n".join(formatted_message_history_list)
 
+    # Build author/username maps for stat-driven features
+    message_id_to_author = {str(msg.id): msg.author.id for msg in message_history}
+    rel_id_to_author = {idx + 1: msg.author.id for idx, msg in enumerate(message_history)}
+    username_id_map: dict[str, int] = {}
+    for msg in message_history:
+        username_id_map.setdefault(msg.author.name, msg.author.id)
+        username_id_map.setdefault(msg.author.display_name, msg.author.id)
+
     # Ensure channel_name is not None
     if channel_name is None:
         channel_name = "Unknown Channel"
@@ -286,5 +348,8 @@ async def get_candidate_features(
         formatted_message_history,
         channel_name,
         thread_name,
-        required_message_indexes=required_message_indexes
+        required_message_indexes=required_message_indexes,
+        author_id_map={**message_id_to_author, **{str(k): v for k, v in rel_id_to_author.items()}},
+        username_id_map=username_id_map,
+        stats_session_factory=get_session,
     )
