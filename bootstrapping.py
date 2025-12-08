@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import sys
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -46,6 +47,7 @@ from user_stats import (
     get_familiarity_score_stat,
     get_seniority_scores,
 )
+from utils import serialize_context_messages
 
 # Configure logging with timestamps and level
 logging.basicConfig(
@@ -90,6 +92,7 @@ class BootstrapState:
     rated_messages: list[RatedMessage] = field(default_factory=list)
     messages_with_context: list[RatedMessage] = field(default_factory=list)
     messages_with_features: list[RatedMessage] = field(default_factory=list)
+    excluded_message_ids: set[int] = field(default_factory=set)
     X_train: np.ndarray | None = None
     X_test: np.ndarray | None = None
     y_train: np.ndarray | None = None
@@ -398,27 +401,16 @@ async def fetch_discord_context(rated_messages: list[RatedMessage]) -> list[Rate
                     context_messages.extend(after_messages)
                     
                     # Store context message IDs and serialized data
-                    rated_msg.context_message_ids = [m.id for m in context_messages]
+                    context_ids, serialized_context = serialize_context_messages(
+                        context_messages,
+                        channel_name=channel_name,
+                        parent_channel_name=parent_channel_name,
+                        thread_name=thread_name,
+                    )
+                    rated_msg.context_message_ids = context_ids
                     rated_msg.channel_name = channel_name
                     rated_msg.thread_name = thread_name
-                    rated_msg.context_messages = [
-                        {
-                            "id": m.id,
-                            "content": m.content,
-                            "author_id": m.author.id,
-                            "author_name": m.author.display_name,
-                            "author_username": m.author.name,
-                            "timestamp": m.created_at.isoformat(),
-                            "edited_at": m.edited_at.isoformat() if m.edited_at else None,
-                            "reference_id": m.reference.message_id if m.reference else None,
-                            "attachments": len(m.attachments) > 0,
-                            "reactions": [(str(r.emoji), r.count) for r in m.reactions],
-                            "channel_name": channel_name,
-                            "parent_channel_name": parent_channel_name,
-                            "thread_name": thread_name,
-                        }
-                        for m in context_messages
-                    ]
+                    rated_msg.context_messages = serialized_context
                     
                     newly_fetched.append(rated_msg)
                     processed += 1
@@ -1243,7 +1235,8 @@ def prepare_training_data(
     collapse_ambiguous_to_no_flag: bool = False,
     refresh_stats: bool = True,
     active_feature_names: list[str] | None = None,
-    ignored_features: set[str] | None = None
+    ignored_features: set[str] | None = None,
+    exclude_message_ids: set[int] | None = None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Prepare feature matrices and labels for training.
@@ -1257,6 +1250,7 @@ def prepare_training_data(
         refresh_stats: Whether to refresh seniority/familiarity stats from the database
         active_feature_names: Ordered feature list to include (defaults to FEATURE_NAMES)
         ignored_features: Feature names to drop (ignored if active_feature_names supplied)
+        exclude_message_ids: Message IDs to drop entirely from training
         
     Returns:
         Tuple of (X_train, X_test, y_train, y_test)
@@ -1338,6 +1332,25 @@ def prepare_training_data(
 
     # Remove high discusses_ellie messages to keep training data clean
     messages_with_features = filter_discusses_ellie_messages(messages_with_features)
+
+    # Exclude specific message IDs when requested
+    excluded_ids = exclude_message_ids or set()
+    if excluded_ids:
+        existing_ids = {msg.message_id for msg in messages_with_features}
+        remaining_messages = [msg for msg in messages_with_features if msg.message_id not in excluded_ids]
+        removed_count = len(messages_with_features) - len(remaining_messages)
+        missing_ids = excluded_ids - existing_ids
+        messages_with_features = remaining_messages
+        logger.info(
+            "Excluded %d messages by ID (remaining: %d)",
+            removed_count,
+            len(messages_with_features),
+        )
+        if missing_ids:
+            logger.warning(
+                "Requested exclusions not found in feature set: %s",
+                ", ".join(map(str, sorted(missing_ids))),
+            )
 
     # Build feature matrix
     X = []
@@ -1537,6 +1550,8 @@ def print_state():
     print(f"Rated messages loaded: {len(state.rated_messages)}")
     print(f"Messages with context: {len(state.messages_with_context)}")
     print(f"Messages with features: {len(state.messages_with_features)}")
+    if state.excluded_message_ids:
+        print(f"Excluded message IDs: {len(state.excluded_message_ids)}")
     total_feature_vectors = sum(len(msg.features or []) for msg in state.messages_with_features)
     if total_feature_vectors:
         print(f"Feature vectors available: {total_feature_vectors}")
@@ -1566,6 +1581,7 @@ async def run_full_pipeline(
     collapse_categories: bool = False,
     collapse_ambiguous_to_no_flag: bool = False,
     include_extra_candidates_as_na: bool = False,
+    exclude_message_ids: set[int] | None = None,
 ):
     """
     Run the complete bootstrapping pipeline.
@@ -1578,11 +1594,13 @@ async def run_full_pipeline(
         collapse_categories: Whether to collapse rating categories before training
         collapse_ambiguous_to_no_flag: Whether to map ambiguous to no-flag when collapsing
         include_extra_candidates_as_na: Whether to keep non-flagged candidates as NA
+        exclude_message_ids: Message IDs to drop entirely before training
     """
     logger.info("Starting full bootstrapping pipeline...")
     # Full pipeline always starts with all features unless overridden later
     state.ignored_features = set()
     state.active_feature_names = FEATURE_NAMES.copy()
+    state.excluded_message_ids = exclude_message_ids or set()
     
     # Step 1: Load data
     state.rated_messages = load_rating_data()
@@ -1622,7 +1640,8 @@ async def run_full_pipeline(
         collapse_categories=collapse_categories,
         collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag,
         active_feature_names=state.active_feature_names,
-        ignored_features=state.ignored_features
+        ignored_features=state.ignored_features,
+        exclude_message_ids=state.excluded_message_ids,
     )
     state.X_train = X_train
     state.X_test = X_test
@@ -1823,6 +1842,19 @@ async def repl():
                 print(f"Ignoring features: {', '.join(sorted(state.ignored_features))}")
             else:
                 print("Using all features for training.")
+
+            exclude_input = input(
+                "Message IDs to exclude from training (comma/space separated, blank for none): "
+            ).strip()
+            if exclude_input:
+                tokens = re.split(r"[,\s]+", exclude_input)
+                state.excluded_message_ids = {int(token) for token in tokens if token.isdigit()}
+                if state.excluded_message_ids:
+                    print(f"Excluding {len(state.excluded_message_ids)} message(s) from training.")
+                else:
+                    print("No valid message IDs parsed; not excluding any messages.")
+            else:
+                state.excluded_message_ids = set()
             
             # Always prepare data with the selected category handling
             state.X_train, state.X_test, state.y_train, state.y_test = prepare_training_data(
@@ -1830,7 +1862,8 @@ async def repl():
                 collapse_categories=collapse_categories,
                 collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag,
                 active_feature_names=state.active_feature_names,
-                ignored_features=state.ignored_features
+                ignored_features=state.ignored_features,
+                exclude_message_ids=state.excluded_message_ids,
             )
             
             if state.X_train is not None and state.y_train is not None:

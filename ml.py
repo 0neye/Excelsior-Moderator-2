@@ -267,3 +267,16 @@ def create_classifier(model_type: str = "lightgbm", **kwargs) -> ModerationClass
     if model_type_lower == "lightgbm":
         return LightGBMClassifier(**kwargs)
     raise ValueError("Unknown model type: only 'lightgbm' is supported")
+
+def load_classifier(path: str | Path = "models/lightgbm_model.joblib") -> ModerationClassifier:
+    """
+    Load a classifier from disk.
+
+    Args:
+        model_type: The type of model to load
+        path: The path to the model file
+
+    Returns:
+        Loaded classifier instance
+    """
+    return LightGBMClassifier.load(path)

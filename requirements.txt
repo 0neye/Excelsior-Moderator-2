@@ -9,3 +9,6 @@ pydantic
 lightgbm
 joblib
 numpy
+pandas
+matplotlib
+seaborn

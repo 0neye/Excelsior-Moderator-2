@@ -1,14 +1,19 @@
 """Main entry point for the Excelsior Moderator Discord bot."""
 
+from datetime import datetime, timezone
 from typing import Callable
 
 import discord
+import numpy as np
 from sqlalchemy.orm import Session
 
-from config import DISCORD_BOT_TOKEN, CHANNEL_ALLOW_LIST
+from config import DISCORD_BOT_TOKEN, CHANNEL_ALLOW_LIST, MESSAGES_PER_CHECK, WAIVER_ROLE_NAME, REACTION_EMOJI
+from database import FlaggedMessage
 from db_config import init_db, get_session
 from history import MessageStore
 from llms import get_candidate_features
+from ml import FEATURE_NAMES, load_classifier
+from utils import serialize_context_messages
 
 # Set up intents for the bot
 intents = discord.Intents.default()
@@ -29,6 +34,15 @@ class ExcelsiorBot(discord.Bot):
         # Function to get DB sessions
         self.get_db_session: Callable[[], Session] = get_session
     
+
+    async def flag_message(self, message: discord.Message) -> None:
+        """
+        Flags a message by adding a reaction to it.
+        TODO: also add a log message to the mod channel
+        """
+        await message.add_reaction(REACTION_EMOJI)
+
+
     async def moderate_channel(self, channel: discord.TextChannel | discord.Thread) -> None:
         """
         Moderates a channel by running the moderation workflow on the in-memory message store for that channel.
@@ -37,9 +51,85 @@ class ExcelsiorBot(discord.Bot):
             channel: The channel to moderate.
         """
 
-        candidate_features = await get_candidate_features(self.message_store, channel.id)
+        # Copy at time of call to avoid race conditions
+        store_history_copy = self.message_store.get_whole_history(channel.id)
 
-        # then send to the ml pipeline
+        candidates = await get_candidate_features(self.message_store, channel.id, ignore_first_message_count=MESSAGES_PER_CHECK-1)
+
+        # Filter anything with discusses_ellie > 0.2 since that's likely bot-related noise
+        candidates = [candidate for candidate in candidates if candidate["features"]["discusses_ellie"] <= 0.2]
+
+        if not candidates:
+            return
+
+        # Filter out anything directed at a user with the WAIVER_ROLE_NAME role
+        candidate_messages = [next((msg for msg in store_history_copy if msg.id == candidate["discord_message_id"]), None) for candidate in candidates]
+
+        candidate_message_authors = [message.author for message in candidate_messages if message is not None]
+
+        for candidate, message_author in zip(candidates, candidate_message_authors):
+            if message_author.roles and any(role.name == WAIVER_ROLE_NAME for role in message_author.roles):
+                candidates.remove(candidate)
+
+
+        if not candidates:
+            return
+
+        # Filter out candidates that are too close to the beginning of the channel history
+        # since the model is unlikely to have enough context to extract good features
+        # This is redundant, but can't hurt
+        candidates = [
+            candidate for candidate in candidates
+            if candidate.get("message_id", 0) > MESSAGES_PER_CHECK # message_id is 1-based index
+        ]
+
+        if not candidates:
+            return
+            
+        # Get the actual message objects for the candidates
+        candidate_messages = [next((msg for msg in store_history_copy if msg.id == candidate["discord_message_id"]), None) for candidate in candidates]
+
+        # Then send to the ml pipeline
+        classifier = load_classifier("models/lightgbm_model.joblib")
+        feature_matrix = np.array(
+            [
+                [float(candidate["features"].get(name, 0.0)) for name in FEATURE_NAMES]
+                for candidate in candidates
+            ],
+            dtype=float,
+        )
+
+        # Predict using a numpy feature matrix aligned to training order
+        predictions = classifier.predict(feature_matrix)
+        
+        db_session = self.get_db_session()
+
+        for candidate_message, prediction in zip(candidate_messages, predictions):
+            if prediction == "flag" and candidate_message is not None:
+                await self.flag_message(candidate_message)
+                surrounding_context = [msg for msg in store_history_copy if msg.id != candidate_message.id]
+                # Serialize surrounding context for persistent storage
+                context_ids, serialized_context = serialize_context_messages(surrounding_context)
+
+                flagged_message = FlaggedMessage(
+                    message_id=candidate_message.id,
+                    channel_id=channel.id,
+                    guild_id=channel.guild.id,
+                    author_id=candidate_message.author.id,
+                    author_username=candidate_message.author.name,
+                    content=candidate_message.content,
+                    context_message_ids=context_ids,
+                    context_messages=serialized_context,
+                    timestamp=candidate_message.created_at.isoformat() if candidate_message.created_at else None,
+                    flagged_at=datetime.now(timezone.utc).isoformat(),
+                    target_user_id=candidate.get("target_user_id"),
+                    target_username=candidate.get("target_username"),
+                )
+                db_session.add(flagged_message)
+                db_session.commit()
+            elif prediction == "no_flag":
+                pass
+
 
 
 # Initialize the bot with a command prefix and intents

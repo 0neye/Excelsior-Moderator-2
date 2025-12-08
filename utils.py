@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, List, Union
+from typing import Any, Optional, Tuple, List, Union
 import discord
 
 from config import CHANNEL_ALLOW_LIST
@@ -42,6 +42,66 @@ def is_tracked_channel(channel: TrackableChannel) -> bool:
     
     return False
 
+
+def serialize_context_messages(
+    messages: List[discord.Message],
+    channel_name: str | None = None,
+    parent_channel_name: str | None = None,
+    thread_name: str | None = None,
+) -> Tuple[List[int], List[dict[str, Any]]]:
+    """
+    Convert Discord message objects into JSON-serializable payloads for DB storage.
+
+    Args:
+        messages: Messages to serialize, typically a contextual window around a flagged message
+        channel_name: Optional channel name override to embed in every payload
+        parent_channel_name: Optional parent channel name (used when messages are from a thread)
+        thread_name: Optional thread name override to embed in every payload
+
+    Returns:
+        Tuple of (context_message_ids, serialized_context_messages) preserving message order
+    """
+    context_ids: List[int] = []
+    serialized_messages: List[dict[str, Any]] = []
+
+    for message in messages:
+        context_ids.append(message.id)
+
+        resolved_channel_name = channel_name
+        resolved_thread_name = thread_name
+        resolved_parent_channel = parent_channel_name
+
+        channel_obj = getattr(message, "channel", None)
+        if resolved_channel_name is None and channel_obj is not None:
+            if isinstance(channel_obj, discord.Thread):
+                resolved_thread_name = resolved_thread_name or channel_obj.name
+                if channel_obj.parent:
+                    resolved_parent_channel = resolved_parent_channel or channel_obj.parent.name
+                    resolved_channel_name = resolved_parent_channel or channel_obj.name
+                else:
+                    resolved_channel_name = channel_obj.name
+            elif hasattr(channel_obj, "name"):
+                resolved_channel_name = getattr(channel_obj, "name", None)
+
+        serialized_messages.append(
+            {
+                "id": message.id,
+                "content": message.content,
+                "author_id": message.author.id,
+                "author_name": message.author.display_name,
+                "author_username": message.author.name,
+                "timestamp": message.created_at.isoformat(),
+                "edited_at": message.edited_at.isoformat() if message.edited_at else None,
+                "reference_id": message.reference.message_id if message.reference else None,
+                "attachments": len(message.attachments) > 0,
+                "reactions": [(str(reaction.emoji), reaction.count) for reaction in message.reactions],
+                "channel_name": resolved_channel_name,
+                "parent_channel_name": resolved_parent_channel,
+                "thread_name": resolved_thread_name,
+            }
+        )
+
+    return context_ids, serialized_messages
 
 async def get_user_names(
     bot: discord.Bot, guild: discord.Guild, user_id: int

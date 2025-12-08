@@ -109,6 +109,7 @@ async def extract_features_from_formatted_history(
     author_id_map: dict[str, int] | None = None,
     username_id_map: dict[str, int] | None = None,
     stats_session_factory: Callable[[], Any] | None = None,
+    ignore_first_message_count: int = 0,
 ) -> list[dict]:
     """
     Extracts candidate features from formatted message history using LLM.
@@ -125,6 +126,7 @@ async def extract_features_from_formatted_history(
         author_id_map: Optional mapping of message_id/rel_id strings to author IDs for stat features
         username_id_map: Optional mapping of usernames/display names to user IDs
         stats_session_factory: Optional callable to create a DB session for stat lookups
+        ignore_first_message_count: Number of leading messages to treat purely as context when extracting candidates
     
     Returns:
         A list of candidate dicts, each containing message_id, target_username, and features.
@@ -183,6 +185,13 @@ async def extract_features_from_formatted_history(
     If a required message doesn't seem to target anyone specifically, use "Nobody" for target_username and set all features to appropriate values based on the message content.
     """
 
+    ignore_leading_messages_instruction = ""
+    if ignore_first_message_count > 0:
+        ignore_leading_messages_instruction = f"""
+    ### Ignore Context-Only Messages:
+    The first {ignore_first_message_count} messages in the provided history are context only. Do not extract candidates from them or treat them as targets; begin considering candidates starting with message {ignore_first_message_count + 1}.
+    """
+
     system_prompt = f"""
     You will be given a portion of a Discord channel's message history.
     Your job is to follow the process below.
@@ -214,7 +223,7 @@ async def extract_features_from_formatted_history(
     - The message history is provided in chronological order, from oldest to newest.
     - The message history format is: [timestamp] (rel_id) [reply to rel_id or username] ❝message content❞ (edited) [reactions]
     - This is a gaming server discussing the game Cosmoteer: Starship Architect & Commander.
-    {required_msg_instruction}"""
+    {required_msg_instruction}{ignore_leading_messages_instruction}"""
 
     user_prompt = f"""
     ### Discord context:
@@ -306,7 +315,8 @@ async def extract_features_from_formatted_history(
 async def get_candidate_features(
     message_store: MessageStore,
     channel_id: int,
-    required_message_indexes: list[int] | None = None
+    required_message_indexes: list[int] | None = None,
+    ignore_first_message_count: int = 0,
 ) -> list[dict]:
     """
     Identifies potential candidate messages to flag based on the message history.
@@ -317,9 +327,11 @@ async def get_candidate_features(
         channel_id: The Discord channel ID to analyze
         required_message_indexes: Optional list of relative message IDs that MUST have
             features extracted, regardless of whether they appear to be feedback candidates
+        ignore_first_message_count: Number of leading messages to treat purely as context when asking the LLM for features
     
     Returns:
-        A list of candidate dicts, each containing message_id, target_username, and features.
+        A list of candidate dicts, each containing message_id, target_username,
+        target_user_id, and features.
     """
 
     channel_info = message_store.get_channel_info(channel_id)
@@ -335,6 +347,9 @@ async def get_candidate_features(
     # Build author/username maps for stat-driven features
     message_id_to_author = {str(msg.id): msg.author.id for msg in message_history}
     rel_id_to_author = {idx + 1: msg.author.id for idx, msg in enumerate(message_history)}
+    # Map between relative IDs (1-based) and actual Discord message IDs for later resolution
+    rel_id_to_discord_id = {idx + 1: msg.id for idx, msg in enumerate(message_history)}
+    discord_id_lookup = {str(msg.id): msg.id for msg in message_history}
     username_id_map: dict[str, int] = {}
     for msg in message_history:
         username_id_map.setdefault(msg.author.name, msg.author.id)
@@ -344,7 +359,7 @@ async def get_candidate_features(
     if channel_name is None:
         channel_name = "Unknown Channel"
 
-    return await extract_features_from_formatted_history(
+    candidates = await extract_features_from_formatted_history(
         formatted_message_history,
         channel_name,
         thread_name,
@@ -352,4 +367,32 @@ async def get_candidate_features(
         author_id_map={**message_id_to_author, **{str(k): v for k, v in rel_id_to_author.items()}},
         username_id_map=username_id_map,
         stats_session_factory=get_session,
+        ignore_first_message_count=ignore_first_message_count,
     )
+
+    # Attach the resolved target Discord user ID next to the username for downstream lookups
+    # Also attach the specific Discord message ID for each candidate
+    for candidate in candidates:
+        target_username = candidate.get("target_username")
+        candidate["target_user_id"] = (
+            username_id_map.get(target_username)
+            if isinstance(target_username, str)
+            else None
+        )
+        
+        # Resolve the candidate's message_id (which may be relative or a Discord ID) to the real Discord message ID
+        raw_message_id = candidate.get("message_id")
+        discord_message_id = None
+        if isinstance(raw_message_id, str):
+            if raw_message_id in discord_id_lookup:
+                discord_message_id = discord_id_lookup[raw_message_id]
+            elif raw_message_id.isdigit():
+                rel_val = int(raw_message_id)
+                discord_message_id = rel_id_to_discord_id.get(rel_val)
+        elif isinstance(raw_message_id, int):
+            discord_message_id = rel_id_to_discord_id.get(raw_message_id)
+
+        if discord_message_id is not None:
+            candidate["discord_message_id"] = discord_message_id
+
+    return candidates
