@@ -585,6 +585,10 @@ def save_features_to_db(
         run_id = extraction_run.id
         feature_count = 0
         
+        # Track seen (message_id, run_index) combos to avoid unique constraint violations
+        seen_keys: set[tuple[int, int]] = set()
+        duplicate_count = 0
+        
         # Save each message's features
         for msg in messages_with_features:
             if msg.features is None:
@@ -594,6 +598,13 @@ def save_features_to_db(
             feature_list = msg.features if isinstance(msg.features, list) else [msg.features]
             
             for run_index, feature_dict in enumerate(feature_list):
+                # Skip duplicates (can occur when extra candidate messages overlap with main messages)
+                key = (msg.message_id, run_index)
+                if key in seen_keys:
+                    duplicate_count += 1
+                    continue
+                seen_keys.add(key)
+                
                 # Extract target_username from features if present
                 target_username = feature_dict.get("target_username")
                 
@@ -607,6 +618,9 @@ def save_features_to_db(
                 )
                 session.add(msg_features)
                 feature_count += 1
+        
+        if duplicate_count > 0:
+            logger.info(f"Skipped {duplicate_count} duplicate message features")
         
         session.commit()
         logger.info(
@@ -784,6 +798,7 @@ async def extract_features(
     openrouter_model: str = "openai/gpt-oss-120b",
     auto_save: bool = True,
     run_name: str | None = None,
+    include_extra_candidates_as_na: bool = False,
 ) -> tuple[list[RatedMessage], int | None]:
     """
     Extract LLM features from message context using LLM API.
@@ -805,6 +820,8 @@ async def extract_features(
             (Gemini uses the default model configured in llms.py)
         auto_save: Whether to automatically save features to database (default True)
         run_name: Optional name for the extraction run (for DB record)
+        include_extra_candidates_as_na: Whether to keep non-flagged candidates and
+            label them as NA instead of dropping them
         
     Returns:
         Tuple of (messages with features, extraction_run_id or None if auto_save=False)
@@ -814,6 +831,8 @@ async def extract_features(
     logger.info(f"Runs per message: {runs_per_message}")
     if provider == "openrouter":
         logger.info(f"OpenRouter model: {openrouter_model}")
+    if include_extra_candidates_as_na:
+        logger.info("Including extra LLM candidates as NA")
     
     # Ensure stats tables are present so stat features can be populated
     ensure_user_stats_ready()
@@ -828,12 +847,16 @@ async def extract_features(
     semaphore = asyncio.Semaphore(max_concurrent)
     
     # Track results and errors
-    results: list[tuple[int, RatedMessage | None]] = []
+    results: list[tuple[int, RatedMessage | None, list[RatedMessage]]] = []
     error_count = 0
     processed_count = 0
     lock = asyncio.Lock()
     
-    async def process_message(idx: int, rated_msg: RatedMessage) -> tuple[int, RatedMessage | None]:
+    async def process_message(
+        idx: int,
+        rated_msg: RatedMessage,
+        max_retry_attempts: int = 3
+    ) -> tuple[int, RatedMessage | None, list[RatedMessage]]:
         """Process a single message with semaphore-limited concurrency."""
         nonlocal error_count, processed_count
         
@@ -842,9 +865,11 @@ async def extract_features(
                 # Format context messages for LLM
                 formatted_lines = []
                 message_id_to_rel_id = {m["id"]: i + 1 for i, m in enumerate(rated_msg.context_messages)}
+                rel_id_to_ctx: dict[int, dict[str, Any]] = {}
                 
                 for i, ctx_msg in enumerate(rated_msg.context_messages):
                     rel_id = i + 1
+                    rel_id_to_ctx[rel_id] = ctx_msg
                     
                     # Build timestamp
                     timestamp = ""
@@ -898,49 +923,123 @@ async def extract_features(
                 # Call LLM to extract features with channel/thread context
                 channel_name, thread_name = resolve_channel_context(rated_msg)
                 
-                feature_runs: list[dict[str, float]] = []
-                for run_idx in range(runs_per_message):
-                    candidates = await extract_features_from_formatted_history(
-                        formatted_history,
-                        channel_name,
-                        thread_name,
-                        provider=provider,  # type: ignore[arg-type]
-                        openrouter_model=openrouter_model,
-                        required_message_indexes=required_indexes,
-                        author_id_map=author_id_map,
-                        username_id_map=username_id_map,
-                        stats_session_factory=get_session,
-                    )
-                    
-                    # Find features for the flagged message in this run
+                def _resolve_candidate_ctx(raw_id: str | None) -> tuple[int | None, dict[str, Any] | None]:
+                    """Resolve candidate message id to real Discord message id and context."""
+                    if raw_id is None:
+                        return None, None
+                    for ctx in rated_msg.context_messages:
+                        if str(ctx.get("id")) == raw_id:
+                            return ctx.get("id"), ctx
+                    if raw_id.isdigit():
+                        rel_val = int(raw_id)
+                        if rel_val in rel_id_to_ctx:
+                            ctx_match = rel_id_to_ctx[rel_val]
+                            return ctx_match.get("id"), ctx_match
+                    return None, None
+
+                async def _extract_with_retry() -> tuple[list[dict[str, Any]], dict[str, float], str | None]:
+                    """Run LLM extraction with retries until flagged message is present."""
+                    last_error: Exception | None = None
                     flagged_msg_id_str = str(rated_msg.message_id)
-                    
-                    features_found = False
-                    selected_features: dict[str, float] = {}
-                    target_username: str | None = None
-                    for candidate in candidates:
-                        # Match by message_id or relative_id
-                        if (candidate.get("message_id") == flagged_msg_id_str or 
-                            candidate.get("message_id") == str(flagged_rel_id)):
-                            selected_features = candidate.get("features", {})
-                            target_username = candidate.get("target_username")
-                            features_found = True
-                            break
-                    
-                    if not features_found:
-                        # If LLM didn't identify the flagged message as a candidate, use zero features
-                        logger.warning(
-                            f"LLM did not identify message {rated_msg.message_id} as candidate on run {run_idx + 1}, using zero features"
-                        )
-                        selected_features = {name: 0.0 for name in FEATURE_NAMES}
-                    
-                    # Store target_username in features for later stat refreshes
+                    for attempt in range(1, max_retry_attempts + 1):
+                        try:
+                            candidates = await extract_features_from_formatted_history(
+                                formatted_history,
+                                channel_name,
+                                thread_name,
+                                provider=provider,  # type: ignore[arg-type]
+                                openrouter_model=openrouter_model,
+                                required_message_indexes=required_indexes,
+                                author_id_map=author_id_map,
+                                username_id_map=username_id_map,
+                                stats_session_factory=get_session,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            last_error = exc
+                            logger.warning(
+                                f"Extraction attempt {attempt}/{max_retry_attempts} failed for message "
+                                f"{rated_msg.message_id}: {exc}"
+                            )
+                        else:
+                            selected_features: dict[str, float] | None = None
+                            target_username: str | None = None
+                            for candidate in candidates:
+                                if (
+                                    candidate.get("message_id") == flagged_msg_id_str
+                                    or candidate.get("message_id") == str(flagged_rel_id)
+                                ):
+                                    selected_features = candidate.get("features", {})
+                                    target_username = candidate.get("target_username")
+                                    break
+                            if selected_features is not None:
+                                return candidates, selected_features, target_username
+                            logger.warning(
+                                f"Extraction attempt {attempt}/{max_retry_attempts} did not include flagged "
+                                f"message {rated_msg.message_id}"
+                            )
+                        if attempt < max_retry_attempts:
+                            await asyncio.sleep(1.0 * attempt)
+                    raise RuntimeError(
+                        f"LLM did not return features for flagged message {rated_msg.message_id} "
+                        f"after {max_retry_attempts} attempt(s)"
+                    ) from last_error
+
+                feature_runs: list[dict[str, float]] = []
+                extra_feature_runs: dict[int, list[dict[str, float]]] = {}
+                extra_feature_meta: dict[int, dict[str, Any]] = {}
+
+                for run_idx in range(runs_per_message):
+                    candidates, selected_features, target_username = await _extract_with_retry()
+
                     if target_username:
                         selected_features["target_username"] = target_username  # type: ignore[assignment]
-                    
                     feature_runs.append(selected_features)
+
+                    if include_extra_candidates_as_na:
+                        for candidate in candidates:
+                            if (
+                                candidate.get("message_id") == str(rated_msg.message_id)
+                                or candidate.get("message_id") == str(flagged_rel_id)
+                            ):
+                                continue
+                            resolved_id, ctx_meta = _resolve_candidate_ctx(candidate.get("message_id"))
+                            if resolved_id is None or ctx_meta is None:
+                                continue
+                            features_copy = dict(candidate.get("features", {}))
+                            cand_target = candidate.get("target_username")
+                            if isinstance(cand_target, str):
+                                features_copy["target_username"] = cand_target  # type: ignore[assignment]
+                            extra_feature_runs.setdefault(resolved_id, []).append(features_copy)
+                            extra_feature_meta.setdefault(resolved_id, ctx_meta)
                 
                 rated_msg.features = feature_runs
+
+                extra_messages: list[RatedMessage] = []
+                if include_extra_candidates_as_na and extra_feature_runs:
+                    for msg_id, runs in extra_feature_runs.items():
+                        ctx_meta = extra_feature_meta.get(msg_id, {})
+                        author_name = ctx_meta.get("author_username") or ctx_meta.get("author_name") or "Unknown"
+                        extra_messages.append(
+                            RatedMessage(
+                                message_id=msg_id,
+                                channel_id=rated_msg.channel_id,
+                                guild_id=rated_msg.guild_id,
+                                author_id=ctx_meta.get("author_id", 0) or 0,
+                                author_name=author_name,
+                                content=ctx_meta.get("content", ""),
+                                timestamp=ctx_meta.get("timestamp", ""),
+                                flagged_at=rated_msg.flagged_at,
+                                jump_url="",
+                                channel_name=ctx_meta.get("channel_name", rated_msg.channel_name),
+                                thread_name=ctx_meta.get("thread_name", rated_msg.thread_name),
+                                category="NA",
+                                rater_user_id=rated_msg.rater_user_id,
+                                rating_id=f"auto-na-{rated_msg.message_id}-{msg_id}",
+                                context_message_ids=rated_msg.context_message_ids,
+                                context_messages=rated_msg.context_messages,
+                                features=runs,
+                            )
+                        )
                 
                 # Update progress
                 async with lock:
@@ -948,13 +1047,13 @@ async def extract_features(
                     if processed_count % 10 == 0:
                         logger.info(f"Processed {processed_count}/{len(messages_to_process)} messages")
                 
-                return (idx, rated_msg)
+                return (idx, rated_msg, extra_messages)
                 
             except Exception as e:
                 logger.error(f"Error extracting features for message {rated_msg.message_id}: {e}")
                 async with lock:
                     error_count += 1
-                return (idx, None)
+                return (idx, None, [])
     
     # Create tasks for all messages
     tasks = [process_message(i, msg) for i, msg in enumerate(messages_to_process)]
@@ -964,9 +1063,16 @@ async def extract_features(
     
     # Collect successful results, preserving original order
     messages_with_features: list[RatedMessage] = []
-    for idx, result in sorted(results, key=lambda x: x[0]):
+    extra_na_messages: list[RatedMessage] = []
+    for idx, result, extras in sorted(results, key=lambda x: x[0]):
         if result is not None:
             messages_with_features.append(result)
+        if extras:
+            extra_na_messages.extend(extras)
+
+    if extra_na_messages:
+        logger.info(f"Added {len(extra_na_messages)} extra candidate messages labeled as NA")
+        messages_with_features.extend(extra_na_messages)
     
     logger.info(f"Feature extraction complete: {len(messages_with_features)} successful, {error_count} errors")
     
@@ -1462,7 +1568,8 @@ async def run_full_pipeline(
     provider: str = "gemini",
     openrouter_model: str = "openai/gpt-oss-120b",
     collapse_categories: bool = False,
-    collapse_ambiguous_to_no_flag: bool = False
+    collapse_ambiguous_to_no_flag: bool = False,
+    include_extra_candidates_as_na: bool = False,
 ):
     """
     Run the complete bootstrapping pipeline.
@@ -1474,6 +1581,7 @@ async def run_full_pipeline(
         openrouter_model: Model to use with OpenRouter
         collapse_categories: Whether to collapse rating categories before training
         collapse_ambiguous_to_no_flag: Whether to map ambiguous to no-flag when collapsing
+        include_extra_candidates_as_na: Whether to keep non-flagged candidates as NA
     """
     logger.info("Starting full bootstrapping pipeline...")
     # Full pipeline always starts with all features unless overridden later
@@ -1503,6 +1611,7 @@ async def run_full_pipeline(
         runs_per_message=runs_per_message,
         provider=provider,
         openrouter_model=openrouter_model,
+        include_extra_candidates_as_na=include_extra_candidates_as_na,
     )
     if extraction_run_id:
         logger.info(f"Features saved to database with run_id={extraction_run_id}")
@@ -1718,6 +1827,10 @@ async def repl():
             max_concurrent = int(max_concurrent_input) if max_concurrent_input.isdigit() else 5
             runs_input = input("Feature extraction runs per message (default: 1): ").strip()
             runs_per_message = int(runs_input) if runs_input.isdigit() else 1
+            include_extra_input = input(
+                "Include other LLM candidates as NA instead of dropping? (y/N): "
+            ).strip().lower()
+            include_extra_candidates_as_na = include_extra_input in {"y", "yes"}
             collapse_input = input("Collapse categories for training? (y/N): ").strip().lower()
             collapse_categories = collapse_input in {"y", "yes"}
             collapse_ambiguous_to_no_flag = False
@@ -1745,7 +1858,8 @@ async def repl():
                 provider=provider,
                 openrouter_model=openrouter_model,
                 collapse_categories=collapse_categories,
-                collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag
+                collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag,
+                include_extra_candidates_as_na=include_extra_candidates_as_na
             )
             
         elif choice == "2":
@@ -1795,6 +1909,10 @@ async def repl():
             runs_per_message = int(runs_input) if runs_input.isdigit() else 1
             run_name_input = input("Name for this extraction run (optional): ").strip()
             run_name = run_name_input if run_name_input else None
+            include_extra_input = input(
+                "Include other LLM candidates as NA instead of dropping? (y/N): "
+            ).strip().lower()
+            include_extra_candidates_as_na = include_extra_input in {"y", "yes"}
             
             state.messages_with_features, extraction_run_id = await extract_features(
                 messages,
@@ -1803,6 +1921,7 @@ async def repl():
                 provider=provider,
                 openrouter_model=openrouter_model,
                 run_name=run_name,
+                include_extra_candidates_as_na=include_extra_candidates_as_na,
             )
             print(f"Extracted features for {len(state.messages_with_features)} messages")
             if extraction_run_id:
