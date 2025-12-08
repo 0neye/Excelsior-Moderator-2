@@ -9,4 +9,3 @@ pydantic
 lightgbm
 joblib
 numpy
-torch

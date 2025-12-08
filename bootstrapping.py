@@ -4,7 +4,7 @@ Provides a REPL menu for running full or partial training pipelines including:
 - Loading rated messages from rating_system_log.json
 - Fetching Discord context around flagged messages
 - Extracting LLM features from message history
-- Training LightGBM, MLP, or logistic regression classifiers
+- Training a LightGBM classifier
 - Evaluating model performance with metrics
 """
 
@@ -1391,28 +1391,25 @@ def prepare_training_data(
 def train_model(
     X_train: np.ndarray,
     y_train: np.ndarray,
-    model_type: str = "lightgbm",
     feature_names: list[str] | None = None
 ) -> ModerationClassifier:
     """
-    Train a classifier on the training data.
+    Train the LightGBM classifier on the training data.
     
     Args:
         X_train: Training feature matrix
         y_train: Training labels
-        model_type: Type of model to train ('lightgbm', 'mlp', or 'logistic')
         feature_names: Ordered feature names used for training
         
     Returns:
         Trained classifier
     """
     logger.info(
-        "Training %s model with %d features...",
-        model_type,
+        "Training LightGBM model with %d features...",
         len(feature_names or FEATURE_NAMES),
     )
     
-    model = create_classifier(model_type)
+    model = create_classifier("lightgbm")
     # Attach active feature names for downstream importance reporting
     if feature_names:
         model.feature_names = feature_names  # type: ignore[attr-defined]
@@ -1420,7 +1417,7 @@ def train_model(
     
     # Save model
     MODEL_SAVE_DIR.mkdir(exist_ok=True)
-    model_path = MODEL_SAVE_DIR / f"{model_type}_model.joblib"
+    model_path = MODEL_SAVE_DIR / "lightgbm_model.joblib"
     model.save(model_path)
     logger.info(f"Model saved to {model_path}")
     
@@ -1525,13 +1522,12 @@ def print_menu():
     print("2. Load data only (from rating_system_log.json)")
     print("3. Fetch Discord context (requires bot connection)")
     print("4. Extract LLM features (from stored context)")
-    print("5. Train model (LightGBM, MLP, or logistic regression)")
+    print("5. Train model (LightGBM)")
     print("6. Evaluate model (on held-out test set)")
     print("7. Show current state")
-    print("8. Save/Load state to JSON file")
-    print("9. Exit")
-    print("10. Collect user statistics from Discord (channels & threads)")
-    print("11. List/Load features from database")
+    print("8. List/Load features from database")
+    print("9. Collect user statistics from Discord (channels & threads)")
+    print("10. Exit")
     print("=" * 50)
 
 
@@ -1643,150 +1639,12 @@ async def run_full_pipeline(
     state.model = train_model(
         X_train,
         y_train,
-        state.model_type,
         feature_names=state.active_feature_names,
     )
     
     # Step 5: Evaluate
     evaluate_model(state.model, X_test, y_test)
-    
-    # Step 6: Persist pipeline state for resumption/debugging
-    save_state_to_file()
-    
     logger.info("Full pipeline complete!")
-
-
-def save_state_to_file(filepath: str = "bootstrap_state.json"):
-    """Save current state to a JSON file for later resumption."""
-    logger.info(f"Saving state to {filepath}...")
-    
-    # Serialize rated messages with context
-    serializable_messages = []
-    for msg in state.messages_with_features or state.messages_with_context or state.rated_messages:
-        serializable_messages.append({
-            "message_id": msg.message_id,
-            "channel_id": msg.channel_id,
-            "guild_id": msg.guild_id,
-            "author_id": msg.author_id,
-            "author_name": msg.author_name,
-            "content": msg.content,
-            "timestamp": msg.timestamp,
-            "flagged_at": msg.flagged_at,
-            "jump_url": msg.jump_url,
-            "channel_name": msg.channel_name,
-            "thread_name": msg.thread_name,
-            "category": msg.category,
-            "rater_user_id": msg.rater_user_id,
-            "rating_id": msg.rating_id,
-            "context_message_ids": msg.context_message_ids,
-            "context_messages": msg.context_messages,
-            "features": msg.features,
-        })
-    
-    state_data = {
-        "messages": serializable_messages,
-        "model_type": state.model_type,
-        "collapse_categories": state.collapse_categories,
-        "collapse_ambiguous_to_no_flag": state.collapse_ambiguous_to_no_flag,
-        "active_feature_names": state.active_feature_names,
-        "ignored_features": sorted(state.ignored_features),
-    }
-    
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(state_data, f, indent=2)
-    
-    logger.info(f"State saved: {len(serializable_messages)} messages")
-
-
-def load_state_from_file(
-    filepath: str = "bootstrap_state.json",
-    save_to_db: bool = True,
-    run_name: str | None = None,
-) -> int | None:
-    """
-    Load state from a JSON file and optionally persist features to the database.
-    
-    Args:
-        filepath: Path to the JSON state file.
-        save_to_db: Whether to create a new DB extraction run with the loaded features.
-        run_name: Optional name for the extraction run when saving to DB.
-        
-    Returns:
-        Extraction run ID if features were saved to DB, otherwise None.
-    """
-    logger.info(f"Loading state from {filepath}...")
-    
-    if not Path(filepath).exists():
-        logger.error(f"State file not found: {filepath}")
-        return None
-    
-    with open(filepath, "r", encoding="utf-8") as f:
-        state_data = json.load(f)
-    
-    # Deserialize messages
-    messages = []
-    for msg_data in state_data["messages"]:
-        raw_features = msg_data.get("features")
-        normalized_features: list[dict[str, float]] | None = None
-        if isinstance(raw_features, list):
-            normalized_features = raw_features
-        elif isinstance(raw_features, dict):
-            # Backward compatibility for states saved before multi-run support
-            normalized_features = [raw_features]
-        
-        msg = RatedMessage(
-            message_id=msg_data["message_id"],
-            channel_id=msg_data["channel_id"],
-            guild_id=msg_data["guild_id"],
-            author_id=msg_data["author_id"],
-            author_name=msg_data["author_name"],
-            content=msg_data["content"],
-            timestamp=msg_data["timestamp"],
-            flagged_at=msg_data["flagged_at"],
-            jump_url=msg_data["jump_url"],
-            channel_name=msg_data.get("channel_name"),
-            thread_name=msg_data.get("thread_name"),
-            category=msg_data["category"],
-            rater_user_id=msg_data["rater_user_id"],
-            rating_id=msg_data["rating_id"],
-            context_message_ids=msg_data.get("context_message_ids", []),
-            context_messages=msg_data.get("context_messages", []),
-            features=normalized_features,
-        )
-        messages.append(msg)
-    
-    # Categorize by what data is available
-    state.rated_messages = messages
-    state.messages_with_context = [m for m in messages if m.context_messages]
-    state.messages_with_features = [m for m in messages if m.features]
-    state.model_type = state_data.get("model_type", "lightgbm")
-    state.collapse_categories = state_data.get("collapse_categories", False)
-    state.collapse_ambiguous_to_no_flag = state_data.get("collapse_ambiguous_to_no_flag", False)
-    state.active_feature_names = state_data.get("active_feature_names", FEATURE_NAMES)
-    state.ignored_features = set(state_data.get("ignored_features", []))
-    
-    logger.info(f"State loaded: {len(messages)} messages")
-    logger.info(f"  With context: {len(state.messages_with_context)}")
-    logger.info(f"  With features: {len(state.messages_with_features)}")
-    
-    extraction_run_id: int | None = None
-    if save_to_db and state.messages_with_features:
-        # Infer runs_per_message from loaded data (max length across messages)
-        runs_per_message = max(len(m.features or []) for m in state.messages_with_features) or 1
-        inferred_run_name = run_name or f"imported_from_{Path(filepath).name}"
-        extraction_run_id = save_features_to_db(
-            state.messages_with_features,
-            provider="imported",
-            model_name=None,
-            runs_per_message=runs_per_message,
-            run_name=inferred_run_name,
-        )
-        logger.info(
-            "Saved loaded features to database "
-            f"(run_id={extraction_run_id}, messages={len(state.messages_with_features)})"
-        )
-    
-    return extraction_run_id
 
 
 async def repl():
@@ -1798,7 +1656,7 @@ async def repl():
         print_menu()
         
         try:
-            choice = input("\nEnter choice (1-9): ").strip()
+            choice = input("\nEnter choice (1-10): ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nExiting...")
             break
@@ -1839,18 +1697,7 @@ async def repl():
                     "Collapse ambiguous into no-flag? (y/N): "
                 ).strip().lower()
                 collapse_ambiguous_to_no_flag = collapse_ambiguous_input in {"y", "yes"}
-            
-            print("\nSelect model type for training:")
-            print("1. LightGBM (faster, interpretable)")
-            print("2. MLP (neural network)")
-            print("3. Logistic regression (linear baseline)")
-            model_choice_full = input("Enter choice (1-3): ").strip()
-            if model_choice_full == "2":
-                state.model_type = "mlp"
-            elif model_choice_full == "3":
-                state.model_type = "logistic"
-            else:
-                state.model_type = "lightgbm"
+            state.model_type = "lightgbm"
 
             await run_full_pipeline(
                 max_concurrent=max_concurrent,
@@ -1932,19 +1779,7 @@ async def repl():
             if not state.messages_with_features:
                 print("No features available. Run options 2-4 first.")
                 continue
-            
-            # Ask for model type
-            print("\nSelect model type:")
-            print("1. LightGBM (faster, interpretable)")
-            print("2. MLP (neural network)")
-            print("3. Logistic regression (linear baseline)")
-            model_choice = input("Enter choice (1-3): ").strip()
-            if model_choice == "2":
-                state.model_type = "mlp"
-            elif model_choice == "3":
-                state.model_type = "logistic"
-            else:
-                state.model_type = "lightgbm"
+            state.model_type = "lightgbm"
             
             collapse_input = input("Collapse categories for training? (y/N): ").strip().lower()
             collapse_categories = collapse_input in {"y", "yes"}
@@ -2002,10 +1837,9 @@ async def repl():
                 state.model = train_model(
                     state.X_train,
                     state.y_train,
-                    state.model_type,
                     feature_names=state.active_feature_names,
                 )
-                print(f"Model trained: {state.model_type}")
+                print("Model trained: lightgbm")
             else:
                 print("Training data not prepared. Run option 4 first.")
             
@@ -2021,24 +1855,37 @@ async def repl():
             print_state()
             
         elif choice == "8":
-            # Save/Load state
-            print("\n1. Save state")
-            print("2. Load state")
-            sl_choice = input("Enter choice (1-2): ").strip()
+            # List/Load features from database
+            print("\n--- Feature Extraction Runs in Database ---")
+            runs = list_extraction_runs()
             
-            if sl_choice == "1":
-                filepath = input("Enter filename (default: bootstrap_state.json): ").strip()
-                save_state_to_file(filepath or "bootstrap_state.json")
-            elif sl_choice == "2":
-                filepath = input("Enter filename (default: bootstrap_state.json): ").strip()
-                run_id = load_state_from_file(filepath or "bootstrap_state.json")
-                if run_id:
-                    print(f"Features saved to database from imported state (run_id={run_id})")
+            if not runs:
+                print("No extraction runs found in database.")
+                continue
+            
+            print(f"{'ID':<5} {'Name':<25} {'Provider':<12} {'Messages':<10} {'Created':<20}")
+            print("-" * 75)
+            for run in runs:
+                print(
+                    f"{run['id']:<5} {run['name'][:24]:<25} {run['provider']:<12} "
+                    f"{run['message_count']:<10} {run['created_at']:<20}"
+                )
+            print()
+            
+            load_choice = input("Enter run ID to load (or press Enter to cancel): ").strip()
+            if load_choice.isdigit():
+                run_id = int(load_choice)
+                try:
+                    state.messages_with_features = load_features_from_db(run_id)
+                    state.messages_with_context = state.messages_with_features
+                    state.rated_messages = state.messages_with_features
+                    print(f"Loaded {len(state.messages_with_features)} messages with features from run {run_id}")
+                except ValueError as e:
+                    print(f"Error: {e}")
+            else:
+                print("Load cancelled.")
             
         elif choice == "9":
-            print("Exiting...")
-            break
-        elif choice == "10":
             print("\nCollecting user statistics from tracked channels.")
             print("This will fetch up to ~10000 messages per channel and update the stats tables.")
             limit_input = input("Max messages per channel (default 10000): ").strip()
@@ -2062,43 +1909,11 @@ async def repl():
                 f"Messages: {summary['messages_processed']}, "
                 f"Windows updated: {summary['windows_processed']}"
             )
-        
-        elif choice == "11":
-            # List/Load features from database
-            print("\n--- Feature Extraction Runs in Database ---")
-            runs = list_extraction_runs()
-            
-            if not runs:
-                print("No extraction runs found in database.")
-                continue
-            
-            # Display available runs
-            print(f"{'ID':<5} {'Name':<25} {'Provider':<12} {'Messages':<10} {'Created':<20}")
-            print("-" * 75)
-            for run in runs:
-                print(
-                    f"{run['id']:<5} {run['name'][:24]:<25} {run['provider']:<12} "
-                    f"{run['message_count']:<10} {run['created_at']:<20}"
-                )
-            print()
-            
-            # Ask if user wants to load a run
-            load_choice = input("Enter run ID to load (or press Enter to cancel): ").strip()
-            if load_choice.isdigit():
-                run_id = int(load_choice)
-                try:
-                    state.messages_with_features = load_features_from_db(run_id)
-                    # Also populate other state lists for consistency
-                    state.messages_with_context = state.messages_with_features
-                    state.rated_messages = state.messages_with_features
-                    print(f"Loaded {len(state.messages_with_features)} messages with features from run {run_id}")
-                except ValueError as e:
-                    print(f"Error: {e}")
-            else:
-                print("Load cancelled.")
-            
+        elif choice == "10":
+            print("Exiting...")
+            break
         else:
-            print("Invalid choice. Please enter 1-11.")
+            print("Invalid choice. Please enter 1-10.")
 
 
 def main():
