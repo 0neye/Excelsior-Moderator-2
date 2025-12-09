@@ -269,7 +269,7 @@ async def retrain_model(
 
             # No test split because at this point we've already tested the model with the bootstrapping module
             X_train, _, y_train, _ = train_test_split(
-                X, y, test_size=0.0, random_state=42, stratify=y
+                X, y, test_size=0.01, random_state=42, stratify=y
             )
 
         logger.info("Training with %d samples...", len(y_train))

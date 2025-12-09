@@ -13,6 +13,9 @@ if TYPE_CHECKING:
     from bot import ModerationResult
 
 
+ADMIN_ROLE = "Custodian (admin)"
+
+
 def is_moderator():
     """Check if the user has one of the moderator roles."""
     async def predicate(ctx: discord.ApplicationContext) -> bool:
@@ -24,6 +27,18 @@ def is_moderator():
         
         # Check if any moderator role is in the member's roles
         return any(role in member_role_names for role in MODERATOR_ROLES)
+    
+    return commands.check(predicate)  # type: ignore[arg-type]
+
+
+def is_admin():
+    """Check if the user has the admin role."""
+    async def predicate(ctx: discord.ApplicationContext) -> bool:
+        if not ctx.guild or not isinstance(ctx.author, discord.Member):
+            return False
+        
+        member_role_names = [role.name for role in ctx.author.roles]
+        return ADMIN_ROLE in member_role_names
     
     return commands.check(predicate)  # type: ignore[arg-type]
 
@@ -120,6 +135,36 @@ class Restricted(commands.Cog):
                     )
 
         asyncio.create_task(_run_and_report())
+
+    @discord.slash_command(name="retrain", description="Manually trigger model retraining (admin only)")
+    @is_admin()
+    async def retrain(self, ctx: discord.ApplicationContext):
+        """
+        Manually trigger retraining of the moderation classifier model.
+
+        This bypasses the normal rating count threshold and immediately
+        starts a retraining run using available features.
+        """
+        await ctx.respond("Starting model retraining...", ephemeral=True)
+
+        async def _run_retrain():
+            try:
+                from training import retrain_model
+
+                success = await retrain_model()
+                if success:
+                    result_msg = "✅ Model retraining completed successfully!"
+                else:
+                    result_msg = "⚠️ Model retraining returned False (check logs for details)"
+            except Exception as e:
+                result_msg = f"❌ Model retraining failed: {e}"
+
+            try:
+                await ctx.interaction.edit_original_response(content=result_msg)
+            except Exception:
+                await ctx.interaction.followup.send(result_msg, ephemeral=True)
+
+        asyncio.create_task(_run_retrain())
 
     async def cog_command_error(self, ctx: discord.ApplicationContext, error: Exception):
         """Handle errors for commands in this cog."""
