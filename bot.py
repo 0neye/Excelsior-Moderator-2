@@ -23,7 +23,7 @@ from config import (
     DEFAULT_LLM_MODEL,
     get_logger,
 )
-from database import FlaggedMessage, LogChannelRatingPost
+from database import FlaggedMessage, LogChannelRatingPost, MessageFeatures
 from db_config import init_db, get_session
 from history import MessageStore
 from llms import get_candidate_features
@@ -617,7 +617,7 @@ class ExcelsiorBot(discord.Bot):
         
         db_session = self.get_db_session()
         try:
-            # Get message IDs that would be flagged so we can check which already exist
+            # Collect all candidate IDs that are predicted to be flagged
             candidate_message_ids_to_flag = [
                 candidate_message.id
                 for candidate, candidate_message, prediction in zip(candidates, candidate_messages, predictions)
@@ -626,6 +626,7 @@ class ExcelsiorBot(discord.Bot):
             
             # Query for existing flagged message IDs to avoid duplicate inserts
             existing_flagged_ids: set[int] = set()
+            runtime_feature_ids: set[int] = set()
             if candidate_message_ids_to_flag:
                 existing_rows = db_session.query(FlaggedMessage.message_id).filter(
                     FlaggedMessage.message_id.in_(candidate_message_ids_to_flag)
@@ -638,57 +639,84 @@ class ExcelsiorBot(discord.Bot):
                         len(existing_flagged_ids),
                         channel.id,
                     )
+                # Check which runtime feature rows already exist so we do not violate unique constraints
+                existing_runtime_feature_rows = (
+                    db_session.query(MessageFeatures.message_id)
+                    .filter(
+                        MessageFeatures.extraction_run_id.is_(None),
+                        MessageFeatures.message_id.in_(candidate_message_ids_to_flag),
+                    )
+                    .all()
+                )
+                runtime_feature_ids = {row[0] for row in existing_runtime_feature_rows}
             
             # Collect all flagged messages first, then commit once at the end
             flagged_messages_to_add: list[FlaggedMessage] = []
+            # Capture runtime feature rows so we retain the model inputs alongside flags
+            feature_records_to_add: list[MessageFeatures] = []
             
             for candidate, candidate_message, prediction in zip(candidates, candidate_messages, predictions):
                 if prediction == "flag" and candidate_message is not None:
-                    # Skip if already flagged in database
-                    if candidate_message.id in existing_flagged_ids:
-                        continue
+                    # Skip flag insert when it already exists, but still consider persisting features
+                    if candidate_message.id not in existing_flagged_ids:
+                        logger.info(
+                            "Flagging message %s in channel %s (author_id=%s)",
+                            candidate_message.id,
+                            channel.id,
+                            getattr(candidate_message.author, "id", "unknown"),
+                        )
+                        await self.flag_message(candidate_message, db_session)
+                        surrounding_context = [msg for msg in store_history_copy if msg.id != candidate_message.id]
+                        # Serialize surrounding context for persistent storage
+                        context_ids, serialized_context = serialize_context_messages(surrounding_context)
+                        
+                        flagged_message = FlaggedMessage(
+                            message_id=candidate_message.id,
+                            channel_id=channel.id,
+                            guild_id=channel.guild.id,
+                            author_id=candidate_message.author.id,
+                            # Store both display_name and username for user-friendly rendering
+                            author_display_name=getattr(
+                                candidate_message.author, "display_name", None
+                            ),
+                            author_username=candidate_message.author.name,
+                            content=candidate_message.content,
+                            context_message_ids=context_ids,
+                            context_messages=serialized_context,
+                            # Store native datetimes to match the ORM schema
+                            timestamp=candidate_message.created_at if candidate_message.created_at else datetime.now(timezone.utc),
+                            flagged_at=datetime.now(timezone.utc),
+                            target_user_id=candidate.get("target_user_id"),
+                            target_username=candidate.get("target_username"),
+                        )
+                        flagged_messages_to_add.append(flagged_message)
                     
-                    logger.info(
-                        "Flagging message %s in channel %s (author_id=%s)",
-                        candidate_message.id,
-                        channel.id,
-                        getattr(candidate_message.author, "id", "unknown"),
-                    )
-                    await self.flag_message(candidate_message, db_session)
-                    surrounding_context = [msg for msg in store_history_copy if msg.id != candidate_message.id]
-                    # Serialize surrounding context for persistent storage
-                    context_ids, serialized_context = serialize_context_messages(surrounding_context)
-
-                    flagged_message = FlaggedMessage(
-                        message_id=candidate_message.id,
-                        channel_id=channel.id,
-                        guild_id=channel.guild.id,
-                        author_id=candidate_message.author.id,
-                        # Store both display_name and username for user-friendly rendering
-                        author_display_name=getattr(
-                            candidate_message.author, "display_name", None
-                        ),
-                        author_username=candidate_message.author.name,
-                        content=candidate_message.content,
-                        context_message_ids=context_ids,
-                        context_messages=serialized_context,
-                        # Store native datetimes to match the ORM schema
-                        timestamp=candidate_message.created_at if candidate_message.created_at else datetime.now(timezone.utc),
-                        flagged_at=datetime.now(timezone.utc),
-                        target_user_id=candidate.get("target_user_id"),
-                        target_username=candidate.get("target_username"),
-                    )
-                    flagged_messages_to_add.append(flagged_message)
+                    # Persist runtime feature vector for this flagged message when not already saved
+                    if candidate_message.id not in runtime_feature_ids:
+                        feature_payload = candidate.get("features") or {}
+                        if feature_payload:
+                            target_username = feature_payload.get("target_username")
+                            feature_record = MessageFeatures(
+                                extraction_run_id=None,  # Null signals runtime (non-batch) extraction
+                                message_id=candidate_message.id,
+                                run_index=0,
+                                features=feature_payload,
+                                target_username=target_username if isinstance(target_username, str) else None,
+                            )
+                            feature_records_to_add.append(feature_record)
             
-            # Add all flagged messages and commit once
-            if flagged_messages_to_add:
+            # Add all flagged messages and runtime feature rows then commit once
+            if flagged_messages_to_add or feature_records_to_add:
                 logger.info(
-                    "Persisting %d flagged message(s) for channel %s",
+                    "Persisting %d flagged message(s) and %d runtime feature row(s) for channel %s",
                     len(flagged_messages_to_add),
+                    len(feature_records_to_add),
                     channel.id,
                 )
                 for flagged_message in flagged_messages_to_add:
                     db_session.add(flagged_message)
+                for feature_record in feature_records_to_add:
+                    db_session.add(feature_record)
                 db_session.commit()
                 result.flagged_new_count = len(flagged_messages_to_add)
             else:

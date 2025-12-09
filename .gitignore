@@ -9,3 +9,4 @@ models/
 .cursor/
 scripts/
 data/
+analysis_outputs/
