@@ -46,6 +46,11 @@ SECS_BETWEEN_AUTO_CHECKS = 240
 # The number of new ratings before the classifier model is retrained
 NEW_RATINGS_BEFORE_RETRAIN = 20
 
+# Feature extraction mode for continuous training:
+# - "existing_only": Only use messages with pre-extracted features (faster, no LLM cost)
+# - "extract_on_demand": Extract features for new messages via LLM when training (more complete)
+CONTINUOUS_TRAINING_FEATURE_MODE = "existing_only"
+
 # The role for people who don't care about harsh feedback
 WAIVER_ROLE_NAME = "Criticism Pass"
 

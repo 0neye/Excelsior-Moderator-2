@@ -12,7 +12,7 @@ from discord.ext import commands
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from config import RATING_CHANNEL_ID, get_logger
+from config import NEW_RATINGS_BEFORE_RETRAIN, RATING_CHANNEL_ID, get_logger
 from database import FlaggedMessage, FlaggedMessageRating, LogChannelRatingPost, RatingCategory
 from utils import format_markdown_table
 
@@ -51,6 +51,34 @@ def _save_rating_metadata(metadata: dict) -> None:
         json.dump(metadata, f, indent=2)
 
 
+def _get_ratings_since_retrain() -> int:
+    """Get the number of new ratings since the last model retrain."""
+    metadata = _load_rating_metadata()
+    return metadata.get("new_ratings_since_retrain", 0)
+
+
+def _increment_ratings_counter() -> int:
+    """
+    Increment the new ratings counter and return the new count.
+
+    Returns:
+        The new counter value after incrementing
+    """
+    metadata = _load_rating_metadata()
+    count = metadata.get("new_ratings_since_retrain", 0) + 1
+    metadata["new_ratings_since_retrain"] = count
+    _save_rating_metadata(metadata)
+    return count
+
+
+def _reset_ratings_counter() -> None:
+    """Reset the new ratings counter to zero after successful retraining."""
+    metadata = _load_rating_metadata()
+    metadata["new_ratings_since_retrain"] = 0
+    _save_rating_metadata(metadata)
+    logger.info("Reset new_ratings_since_retrain counter to 0")
+
+
 class RatingView(discord.ui.View):
     """View with buttons for rating a flagged message in the public rating channel."""
 
@@ -61,6 +89,7 @@ class RatingView(discord.ui.View):
         message_details: str,
         get_db_session,
         on_rating_complete,
+        on_retrain_check=None,
     ):
         """
         Initialize the rating view.
@@ -71,6 +100,7 @@ class RatingView(discord.ui.View):
             message_details: Pre-formatted message details to display.
             get_db_session: Function to get DB sessions.
             on_rating_complete: Callback when rating is submitted.
+            on_retrain_check: Optional callback to check if model retraining is needed.
         """
         super().__init__(timeout=300)  # 5 minute timeout
         # Store only the ID to avoid detached session issues
@@ -79,6 +109,7 @@ class RatingView(discord.ui.View):
         self.message_details = message_details
         self.get_db_session = get_db_session
         self.on_rating_complete = on_rating_complete
+        self.on_retrain_check = on_retrain_check
         self._rating_submitted = False
         self._interaction: Optional[discord.Interaction] = None
 
@@ -159,6 +190,10 @@ class RatingView(discord.ui.View):
         if self.on_rating_complete:
             await self.on_rating_complete()
 
+        # Check if retraining threshold reached
+        if self.on_retrain_check:
+            await self.on_retrain_check(is_new_rating=True)
+
     @discord.ui.button(label="No Flag", style=discord.ButtonStyle.green, emoji="✅")
     async def no_flag_button(
         self, button: discord.ui.Button, interaction: discord.Interaction
@@ -201,6 +236,54 @@ class Rating(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.get_db_session = bot.get_db_session
+        self._retrain_in_progress = False
+
+    # -------------------------------------------------------------------------
+    # Continuous Training
+    # -------------------------------------------------------------------------
+
+    async def _check_and_trigger_retrain(self, is_new_rating: bool = True) -> None:
+        """
+        Increment the rating counter and trigger model retraining if threshold is reached.
+
+        Only increments counter for new ratings (not updates to existing ratings).
+
+        Args:
+            is_new_rating: True if this is a new rating, False if updating existing
+        """
+        if not is_new_rating:
+            return
+
+        # Increment counter and check threshold
+        new_count = _increment_ratings_counter()
+        logger.info("New ratings since last retrain: %d / %d", new_count, NEW_RATINGS_BEFORE_RETRAIN)
+
+        if new_count >= NEW_RATINGS_BEFORE_RETRAIN:
+            if self._retrain_in_progress:
+                logger.info("Retraining already in progress, skipping")
+                return
+
+            logger.info("Threshold reached, triggering model retraining...")
+            self._retrain_in_progress = True
+
+            # Run retraining in background to avoid blocking
+            self.bot.loop.create_task(self._run_retrain())
+
+    async def _run_retrain(self) -> None:
+        """Execute model retraining and reset counter on success."""
+        try:
+            from training import retrain_model
+
+            success = await retrain_model()
+            if success:
+                _reset_ratings_counter()
+                logger.info("Model retraining completed successfully")
+            else:
+                logger.warning("Model retraining returned False, counter not reset")
+        except Exception as e:
+            logger.error("Error during model retraining: %s", e, exc_info=True)
+        finally:
+            self._retrain_in_progress = False
 
     # -------------------------------------------------------------------------
     # DB Query Helpers
@@ -496,6 +579,7 @@ class Rating(commands.Cog):
 
             category = RATING_EMOJIS[emoji_str]
             now = datetime.now(timezone.utc)
+            is_new_rating = False
 
             if existing_rating:
                 # Update the user's previous rating with the new category
@@ -510,6 +594,7 @@ class Rating(commands.Cog):
                 )
             else:
                 # Create a new rating entry for this user/message pair
+                is_new_rating = True
                 rating_id = f"{payload.user_id}_{post.flagged_message_id}_{uuid.uuid4().hex[:8]}"
                 rating = FlaggedMessageRating(
                     rating_id=rating_id,
@@ -532,6 +617,10 @@ class Rating(commands.Cog):
 
             # Update leaderboard
             await self.update_leaderboard()
+
+            # Check if retraining threshold reached
+            await self._check_and_trigger_retrain(is_new_rating=is_new_rating)
+
             return True
         finally:
             session.close()
@@ -823,6 +912,7 @@ Use `/view_score` to see your personal statistics."""
                 message_details=message_details,
                 get_db_session=self.get_db_session,
                 on_rating_complete=self.update_leaderboard,
+                on_retrain_check=self._check_and_trigger_retrain,
             )
 
             logger.info(
