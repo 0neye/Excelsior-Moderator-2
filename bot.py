@@ -19,6 +19,8 @@ from config import (
     REACTION_EMOJI,
     LOG_CHANNEL_ID,
     SECS_BETWEEN_AUTO_CHECKS,
+    DEFAULT_LLM_PROVIDER,
+    DEFAULT_LLM_MODEL,
     get_logger,
 )
 from database import FlaggedMessage, LogChannelRatingPost
@@ -38,10 +40,6 @@ intents.message_content = True
 
 # Module-level logger configured via config.get_logger
 logger = get_logger(__name__)
-
-# Default LLM selection for moderation feature extraction
-DEFAULT_LLM_PROVIDER = "cerebras"
-DEFAULT_LLM_MODEL = "gpt-oss-120b"
 
 @dataclass
 class ChannelModerationState:

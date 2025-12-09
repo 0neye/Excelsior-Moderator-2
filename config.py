@@ -43,6 +43,9 @@ HISTORY_PER_CHECK = 60
 # Resets after a new message, and doesn't trigger if all messages in channel have already been checked
 SECS_BETWEEN_AUTO_CHECKS = 240
 
+# The number of new ratings before the classifier model is retrained
+NEW_RATINGS_BEFORE_RETRAIN = 20
+
 # The role for people who don't care about harsh feedback
 WAIVER_ROLE_NAME = "Criticism Pass"
 
@@ -67,6 +70,9 @@ LOG_CHANNEL_ID = 1333899222541406310
 
 REACTION_EMOJI = "👁️"
 
+
+DEFAULT_LLM_PROVIDER = "cerebras"
+DEFAULT_LLM_MODEL = "gpt-oss-120b"
 
 
 # Logging config
