@@ -1,4 +1,8 @@
+import logging
 import os
+import sys
+from logging import Logger
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -62,3 +66,36 @@ Additionally, try to focus on the *how* and *why* instead of just the *what*. Te
 LOG_CHANNEL_ID = 1333899222541406310
 
 REACTION_EMOJI = "👁️"
+
+
+
+# Logging config
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+_LOGGING_CONFIGURED = False
+
+
+def configure_logging() -> None:
+    """
+    Configure the root logger with a console handler.
+
+    Uses LOG_LEVEL env override if provided. Idempotent to avoid duplicate
+    handler stacks on reloads.
+    """
+    global _LOGGING_CONFIGURED
+    if _LOGGING_CONFIGURED:
+        return
+
+    logging.basicConfig(
+        level=LOG_LEVEL,
+        format=LOG_FORMAT,
+        handlers=[logging.StreamHandler(sys.stdout)],
+        force=True,
+    )
+    _LOGGING_CONFIGURED = True
+
+
+def get_logger(name: str) -> Logger:
+    """Return a module-specific logger after ensuring global config is set."""
+    configure_logging()
+    return logging.getLogger(name)

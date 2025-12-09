@@ -1,9 +1,16 @@
 """Restricted commands available only to moderators."""
 
+from typing import TYPE_CHECKING
+
+import asyncio
 import discord
 from discord.ext import commands
 
 from config import MODERATOR_ROLES
+from utils import is_tracked_channel
+
+if TYPE_CHECKING:
+    from bot import ModerationResult
 
 
 def is_moderator():
@@ -50,6 +57,69 @@ class Restricted(commands.Cog):
             embed.add_field(name="Your Roles", value=", ".join([r.name for r in ctx.author.roles if r.name != "@everyone"]), inline=False)
         
         await ctx.respond(embed=embed, ephemeral=True)
+
+    @discord.slash_command(name="check", description="Manually trigger moderation for this channel or thread")
+    @is_moderator()
+    async def check(self, ctx: discord.ApplicationContext):
+        """
+        Manually trigger the moderation workflow for the current channel or thread.
+        
+        Args:
+            ctx: Discord application context for the command.
+        """
+        channel = ctx.channel
+
+        # Validate channel type to ensure we can moderate
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            await ctx.respond(
+                "This command can only be used in a text channel or thread.",
+                ephemeral=True,
+            )
+            return
+
+        # Ensure the channel is part of the tracked allow list
+        if not is_tracked_channel(channel):
+            await ctx.respond(
+                "This channel is not tracked by the moderation system.",
+                ephemeral=True,
+            )
+            return
+
+        # Acknowledge quickly so the interaction does not time out
+        await ctx.respond(
+            f"Running moderation for {channel.mention}...", ephemeral=True
+        )
+
+        # Run moderation in the background so the command handler returns quickly
+        async def _run_and_report():
+            try:
+                result: "ModerationResult" = await self.bot.run_moderation_now(channel)
+                # Build a concise summary of the moderation pass outcome
+                summary_lines = [
+                    f"Moderation {'succeeded' if result.success else 'failed'} for {channel.mention}",
+                    f"Reason: {result.reason}",
+                    f"Candidates considered: {result.candidates_considered}",
+                    f"Candidates after filters: {result.candidates_after_filters}",
+                    f"Flagged messages: {result.flagged_new_count} new, {result.flagged_existing_count} already flagged",
+                ]
+                summary = "\n".join(summary_lines)
+                try:
+                    await ctx.interaction.edit_original_response(content=summary)
+                except Exception:
+                    await ctx.interaction.followup.send(summary, ephemeral=True)
+            except Exception:
+                # Attempt to notify about failure without blocking the command
+                try:
+                    await ctx.interaction.edit_original_response(
+                        content="Moderation run failed due to an unexpected error."
+                    )
+                except Exception:
+                    await ctx.interaction.followup.send(
+                        "Moderation run failed due to an unexpected error.",
+                        ephemeral=True,
+                    )
+
+        asyncio.create_task(_run_and_report())
 
     async def cog_command_error(self, ctx: discord.ApplicationContext, error: Exception):
         """Handle errors for commands in this cog."""

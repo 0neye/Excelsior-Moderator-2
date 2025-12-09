@@ -60,7 +60,15 @@ logger = logging.getLogger(__name__)
 # Path to the rating system log file
 DATA_DIR = Path(__file__).parent / "data"
 RATING_LOG_PATH = DATA_DIR / "rating_system_log.json"
+FLAGGED_MESSAGES_PATH = DATA_DIR / "flagged_messages.json"
 MODEL_SAVE_DIR = Path(__file__).parent / "models"
+
+# Default model choices by provider for convenience in prompts and defaults
+DEFAULT_PROVIDER_MODELS = {
+    "gemini": "gemini-2.5-flash",
+    "openrouter": "openai/gpt-oss-120b",
+    "cerebras": "gpt-oss-120b",
+}
 
 
 @dataclass
@@ -172,6 +180,113 @@ def resolve_channel_context(rated_msg: RatedMessage) -> tuple[str, str | None]:
 # STEP 1: Load Data from rating_system_log.json
 # =============================================================================
 
+def load_flagged_messages_into_db() -> int:
+    """
+    Sync all flagged messages from flagged_messages.json into the database.
+    
+    Ensures every flagged message is present in the flagged_messages table,
+    even when a human rating has not been completed. Returns the count of new
+    rows inserted.
+    
+    Returns:
+        Number of flagged messages newly inserted into the database
+    """
+    logger.info(f"Syncing flagged messages into database from {FLAGGED_MESSAGES_PATH}")
+    
+    if not FLAGGED_MESSAGES_PATH.exists():
+        logger.warning("flagged_messages.json not found, skipping flagged message sync")
+        return 0
+    
+    try:
+        with open(FLAGGED_MESSAGES_PATH, "r", encoding="utf-8") as flagged_file:
+            flagged_payload = json.load(flagged_file)
+    except json.JSONDecodeError as exc:
+        logger.error(f"Failed to parse flagged_messages.json: {exc}")
+        return 0
+    
+    if not isinstance(flagged_payload, list):
+        logger.error("flagged_messages.json must contain a JSON array of messages")
+        return 0
+    
+    init_db()
+    session = get_session()
+    
+    inserted_count = 0
+    skipped_invalid = 0
+    
+    try:
+        # Build a set of existing message IDs to avoid per-row queries
+        existing_ids = {
+            row[0] for row in session.query(FlaggedMessage.message_id).all()
+        }
+        new_records: list[FlaggedMessage] = []
+        
+        for entry in flagged_payload:
+            try:
+                message_id = int(entry["message_id"])
+                author_id = int(entry["author_id"])
+                channel_id = int(entry["channel_id"])
+                guild_id = int(entry["guild_id"])
+                content = str(entry.get("content", ""))
+                timestamp_str = str(entry["timestamp"])
+                flagged_at_str = str(entry.get("flagged_at") or entry["timestamp"])
+            except (KeyError, TypeError, ValueError):
+                skipped_invalid += 1
+                continue
+            
+            if not content:
+                skipped_invalid += 1
+                continue
+            
+            if message_id in existing_ids:
+                continue
+            
+            try:
+                timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                flagged_at = datetime.fromisoformat(flagged_at_str.replace("Z", "+00:00"))
+            except ValueError:
+                skipped_invalid += 1
+                continue
+            
+            author_name = str(entry.get("author_name") or "")
+            
+            new_records.append(
+                FlaggedMessage(
+                    message_id=message_id,
+                    author_id=author_id,
+                    author_display_name=author_name or None,
+                    author_username=author_name or None,
+                    content=content,
+                    channel_id=channel_id,
+                    guild_id=guild_id,
+                    context_message_ids=[],
+                    context_messages=[],
+                    timestamp=timestamp,
+                    flagged_at=flagged_at,
+                )
+            )
+            # Track inserted IDs to avoid duplicate inserts when the file repeats IDs
+            existing_ids.add(message_id)
+        
+        if new_records:
+            session.add_all(new_records)
+            session.commit()
+            inserted_count = len(new_records)
+            logger.info("Inserted %d flagged message(s) from flagged_messages.json", inserted_count)
+        else:
+            logger.info("No new flagged messages to insert")
+        
+        if skipped_invalid:
+            logger.warning("Skipped %d flagged message(s) due to missing/invalid fields", skipped_invalid)
+        
+        return inserted_count
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
 def load_rating_data() -> list[RatedMessage]:
     """
     Load and parse rated messages from rating_system_log.json.
@@ -182,6 +297,12 @@ def load_rating_data() -> list[RatedMessage]:
         List of RatedMessage objects with category labels
     """
     logger.info(f"Loading rating data from {RATING_LOG_PATH}")
+    
+    # Ensure the flagged_messages table contains every flagged message from disk,
+    # even when no rating exists yet.
+    inserted_flagged = load_flagged_messages_into_db()
+    if inserted_flagged:
+        logger.info("Flagged message sync added %d new rows", inserted_flagged)
     
     if not RATING_LOG_PATH.exists():
         logger.error(f"Rating log file not found: {RATING_LOG_PATH}")
@@ -784,10 +905,10 @@ def list_extraction_runs() -> list[dict[str, Any]]:
 
 async def extract_features(
     rated_messages: list[RatedMessage],
+    model: str,
     max_concurrent: int = 5,
     runs_per_message: int = 1,
     provider: str = "gemini",
-    openrouter_model: str = "openai/gpt-oss-120b",
     auto_save: bool = True,
     run_name: str | None = None,
     include_extra_candidates_as_na: bool = False,
@@ -805,11 +926,10 @@ async def extract_features(
     
     Args:
         rated_messages: List of rated messages with context
+        model: Model identifier to use for the chosen provider
         max_concurrent: Maximum number of concurrent API calls
         runs_per_message: How many times to run feature extraction per message
         provider: LLM provider to use ("gemini", "openrouter", or "cerebras")
-        openrouter_model: Model to use when provider is "openrouter"
-            (Gemini uses the default model configured in llms.py)
         auto_save: Whether to automatically save features to database (default True)
         run_name: Optional name for the extraction run (for DB record)
         include_extra_candidates_as_na: Whether to keep non-flagged candidates and
@@ -819,10 +939,8 @@ async def extract_features(
         Tuple of (messages with features, extraction_run_id or None if auto_save=False)
     """
     logger.info(f"Extracting LLM features for {len(rated_messages)} messages...")
-    logger.info(f"Provider: {provider}, Max concurrent: {max_concurrent}")
+    logger.info(f"Provider: {provider}, Model: {model}, Max concurrent: {max_concurrent}")
     logger.info(f"Runs per message: {runs_per_message}")
-    if provider == "openrouter":
-        logger.info(f"OpenRouter model: {openrouter_model}")
     if include_extra_candidates_as_na:
         logger.info("Including extra LLM candidates as NA")
     
@@ -936,11 +1054,11 @@ async def extract_features(
                     for attempt in range(1, max_retry_attempts + 1):
                         try:
                             candidates = await extract_features_from_formatted_history(
-                                formatted_history,
-                                channel_name,
-                                thread_name,
+                                formatted_message_history=formatted_history,
+                                channel_name=channel_name,
                                 provider=provider,  # type: ignore[arg-type]
-                                openrouter_model=openrouter_model,
+                                model=model,
+                                thread_name=thread_name,
                                 required_message_indexes=required_indexes,
                                 author_id_map=author_id_map,
                                 username_id_map=username_id_map,
@@ -1071,11 +1189,10 @@ async def extract_features(
     # Auto-save features to database
     extraction_run_id: int | None = None
     if auto_save and messages_with_features:
-        model_name = openrouter_model if provider == "openrouter" else None
         extraction_run_id = save_features_to_db(
             messages_with_features,
             provider=provider,
-            model_name=model_name,
+            model_name=model,
             runs_per_message=runs_per_message,
             run_name=run_name,
         )
@@ -1574,10 +1691,10 @@ def print_state():
 
 
 async def run_full_pipeline(
+    model: str,
     max_concurrent: int = 5,
     runs_per_message: int = 1,
     provider: str = "gemini",
-    openrouter_model: str = "openai/gpt-oss-120b",
     collapse_categories: bool = False,
     collapse_ambiguous_to_no_flag: bool = False,
     include_extra_candidates_as_na: bool = False,
@@ -1587,10 +1704,10 @@ async def run_full_pipeline(
     Run the complete bootstrapping pipeline.
     
     Args:
+        model: Model identifier to use for the selected provider
         max_concurrent: Maximum concurrent API calls for feature extraction
         runs_per_message: How many times to extract features per rated message
         provider: LLM provider ("gemini" default, or "openrouter"/"cerebras")
-        openrouter_model: Model to use with OpenRouter
         collapse_categories: Whether to collapse rating categories before training
         collapse_ambiguous_to_no_flag: Whether to map ambiguous to no-flag when collapsing
         include_extra_candidates_as_na: Whether to keep non-flagged candidates as NA
@@ -1621,10 +1738,10 @@ async def run_full_pipeline(
     # Auto-saves to database and returns (messages, run_id)
     state.messages_with_features, extraction_run_id = await extract_features(
         state.messages_with_context,
+        model=model,
         max_concurrent=max_concurrent,
         runs_per_message=runs_per_message,
         provider=provider,
-        openrouter_model=openrouter_model,
         include_extra_candidates_as_na=include_extra_candidates_as_na,
     )
     if extraction_run_id:
@@ -1694,11 +1811,12 @@ async def repl():
             else:
                 provider = "gemini"
             
-            openrouter_model = "openai/gpt-oss-120b"
-            if provider == "openrouter":
-                model_input = input(f"OpenRouter model (default: {openrouter_model}): ").strip()
-                if model_input:
-                    openrouter_model = model_input
+            default_model = DEFAULT_PROVIDER_MODELS.get(provider, "")
+            model_input = input(f"Model for {provider} (default: {default_model}): ").strip()
+            model = model_input or default_model
+            if not model:
+                print("A model name is required. Please try again.")
+                continue
             
             max_concurrent_input = input("Max concurrent API calls (default: 5): ").strip()
             max_concurrent = int(max_concurrent_input) if max_concurrent_input.isdigit() else 5
@@ -1719,10 +1837,10 @@ async def repl():
             state.model_type = "lightgbm"
 
             await run_full_pipeline(
+                model=model,
                 max_concurrent=max_concurrent,
                 runs_per_message=runs_per_message,
                 provider=provider,
-                openrouter_model=openrouter_model,
                 collapse_categories=collapse_categories,
                 collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag,
                 include_extra_candidates_as_na=include_extra_candidates_as_na
@@ -1763,11 +1881,12 @@ async def repl():
             else:
                 provider = "gemini"
             
-            openrouter_model = "openai/gpt-oss-120b"
-            if provider == "openrouter":
-                model_input = input(f"OpenRouter model (default: {openrouter_model}): ").strip()
-                if model_input:
-                    openrouter_model = model_input
+            default_model = DEFAULT_PROVIDER_MODELS.get(provider, "")
+            model_input = input(f"Model for {provider} (default: {default_model}): ").strip()
+            model = model_input or default_model
+            if not model:
+                print("A model name is required. Please try again.")
+                continue
             
             max_concurrent_input = input("Max concurrent API calls (default: 5): ").strip()
             max_concurrent = int(max_concurrent_input) if max_concurrent_input.isdigit() else 5
@@ -1782,10 +1901,10 @@ async def repl():
             
             state.messages_with_features, extraction_run_id = await extract_features(
                 messages,
+                model=model,
                 max_concurrent=max_concurrent,
                 runs_per_message=runs_per_message,
                 provider=provider,
-                openrouter_model=openrouter_model,
                 run_name=run_name,
                 include_extra_candidates_as_na=include_extra_candidates_as_na,
             )
@@ -1957,7 +2076,11 @@ def main():
     if len(sys.argv) > 1:
         if sys.argv[1] == "--full":
             # Run full pipeline non-interactively
-            asyncio.run(run_full_pipeline())
+            asyncio.run(
+                run_full_pipeline(
+                    model=DEFAULT_PROVIDER_MODELS["gemini"],
+                )
+            )
         elif sys.argv[1] == "--help":
             print("Usage: python bootstrapping.py [--full | --help]")
             print("  --full   Run full pipeline non-interactively")

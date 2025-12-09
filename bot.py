@@ -3,7 +3,7 @@
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Any, Callable
 
 import discord
 import numpy as np
@@ -19,6 +19,7 @@ from config import (
     REACTION_EMOJI,
     LOG_CHANNEL_ID,
     SECS_BETWEEN_AUTO_CHECKS,
+    get_logger,
 )
 from database import FlaggedMessage, LogChannelRatingPost
 from db_config import init_db, get_session
@@ -35,6 +36,12 @@ intents.members = True
 intents.reactions = True
 intents.message_content = True
 
+# Module-level logger configured via config.get_logger
+logger = get_logger(__name__)
+
+# Default LLM selection for moderation feature extraction
+DEFAULT_LLM_PROVIDER = "cerebras"
+DEFAULT_LLM_MODEL = "gpt-oss-120b"
 
 @dataclass
 class ChannelModerationState:
@@ -49,6 +56,21 @@ class ChannelModerationState:
     most_recent_message_id: int | None = None
     trigger_event: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task | None = None
+
+
+@dataclass
+class ModerationResult:
+    success: bool
+    reason: str
+    flagged_new_count: int = 0
+    flagged_existing_count: int = 0
+    candidates_considered: int = 0
+    candidates_after_filters: int = 0
+
+    @property
+    def total_flagged(self) -> int:
+        """Return the total number of flagged messages including existing ones."""
+        return self.flagged_new_count + self.flagged_existing_count
 
 
 class ExcelsiorBot(discord.Bot):
@@ -110,6 +132,23 @@ class ExcelsiorBot(discord.Bot):
             return True
         return False
 
+    def _determine_moderation_reason(self, state: ChannelModerationState) -> str:
+        """
+        Identify why moderation is being triggered (message count vs idle timer).
+        
+        Args:
+            state: Channel moderation state to inspect.
+            
+        Returns:
+            String reason indicating trigger source.
+        """
+        if state.messages_since_check >= MESSAGES_PER_CHECK:
+            return "message_count"
+        remaining = self._compute_idle_timeout(state)
+        if remaining is not None and remaining <= 0:
+            return "idle_timer"
+        return "idle_timer"
+
     def _ensure_scheduler_task(self, channel: discord.TextChannel | discord.Thread) -> None:
         """
         Ensure a scheduler task exists for a tracked channel/thread.
@@ -133,26 +172,83 @@ class ExcelsiorBot(discord.Bot):
             except asyncio.CancelledError:
                 # Allow graceful shutdown without noisy tracebacks
                 return
-            except Exception as exc:
-                print(f"Scheduler for channel {channel_id} crashed: {exc}")
+            except Exception:
+                logger.exception("Scheduler for channel %s crashed", channel_id)
 
         state.task = asyncio.create_task(_runner(channel.id))
+
+    async def trigger_manual_moderation(
+        self, channel: discord.TextChannel | discord.Thread
+    ) -> bool:
+        """
+        Run a manual moderation pass immediately for a channel or thread.
+
+        Args:
+            channel: Channel or thread where moderation should be executed.
+
+        Returns:
+            True when the request succeeds, False when channel is unsupported or not tracked.
+        """
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return False
+        if not is_tracked_channel(channel):
+            return False
+        
+        # Ensure scheduler exists for future automatic checks
+        self._ensure_scheduler_task(channel)
+        result = await self.run_moderation_now(channel)
+        return result.success
+
+    async def run_moderation_now(
+        self, channel: discord.TextChannel | discord.Thread
+    ) -> ModerationResult:
+        """
+        Run moderation immediately for a channel or thread and return detailed results.
+        
+        Args:
+            channel: The channel or thread where moderation should run.
+        
+        Returns:
+            ModerationResult describing the outcome of the run.
+        """
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return ModerationResult(
+                success=False,
+                reason="Unsupported channel type for moderation.",
+            )
+        if not is_tracked_channel(channel):
+            return ModerationResult(
+                success=False,
+                reason="This channel is not tracked by the moderation system.",
+            )
+
+        state = self._get_or_create_channel_state(channel.id)
+        return await self._run_moderation(channel, state, "manual")
 
     async def _run_moderation(
         self,
         channel: discord.TextChannel | discord.Thread,
         state: ChannelModerationState,
-    ) -> None:
+        trigger_reason: str,
+    ) -> ModerationResult:
         """
         Run moderate_channel and update state on completion.
         
         Args:
             channel: Target channel or thread.
             state: Channel state to reset after completion.
+            trigger_reason: Reason moderation was triggered.
         """
-        success = await self.moderate_channel(channel)
+        logger.info(
+            "Starting moderation for channel %s (reason=%s, messages_since_check=%s, last_checked_message_id=%s)",
+            channel.id,
+            trigger_reason,
+            state.messages_since_check,
+            state.last_checked_message_id,
+        )
+        result = await self.moderate_channel(channel)
 
-        if success:
+        if result.success:
             # Reset counters after a successful moderation pass
             state.messages_since_check = 0
             state.has_new_message_since_check = False
@@ -160,6 +256,21 @@ class ExcelsiorBot(discord.Bot):
             state.last_checked_at = datetime.now(timezone.utc)
             recent_message = self.message_store.get_most_recent_message(channel.id)
             state.last_checked_message_id = recent_message.id if recent_message else None
+            logger.info(
+                "Moderation completed for channel %s (reason=%s); counters reset (flagged_new=%s, total_flagged=%s)",
+                channel.id,
+                trigger_reason,
+                result.flagged_new_count,
+                result.total_flagged,
+            )
+        else:
+            logger.warning(
+                "Moderation run returned False for channel %s (reason=%s, details=%s)",
+                channel.id,
+                trigger_reason,
+                result.reason,
+            )
+        return result
 
     async def _moderation_scheduler(self, channel_id: int) -> None:
         """
@@ -201,13 +312,22 @@ class ExcelsiorBot(discord.Bot):
                 state.has_new_message_since_check = False
                 state.messages_since_check = 0
                 state.idle_timer_started_at = None
+                logger.warning(
+                    "Channel %s unavailable for moderation; state reset until next activity",
+                    channel_id,
+                )
                 continue
 
+            trigger_reason = self._determine_moderation_reason(state)
             try:
-                await self._run_moderation(channel, state)
-            except Exception as exc:
+                await self._run_moderation(channel, state, trigger_reason)
+            except Exception:
                 # Log and continue loop so the scheduler keeps running
-                print(f"Moderation run failed for channel {channel_id}: {exc}")
+                logger.exception(
+                    "Moderation run failed for channel %s (reason=%s)",
+                    channel_id,
+                    trigger_reason,
+                )
 
     async def notify_moderation_on_message(self, message: discord.Message) -> None:
         """
@@ -230,6 +350,12 @@ class ExcelsiorBot(discord.Bot):
         if not state.has_new_message_since_check:
             state.has_new_message_since_check = True
             state.idle_timer_started_at = datetime.now(timezone.utc)
+            logger.info(
+                "Idle timer started for channel %s due to message %s by user %s",
+                channel.id,
+                message.id,
+                getattr(message.author, "id", "unknown"),
+            )
 
         # Wake scheduler to consider thresholds immediately
         state.trigger_event.set()
@@ -269,7 +395,11 @@ class ExcelsiorBot(discord.Bot):
         # Post to log channel for mod rating
         log_channel = self.get_channel(LOG_CHANNEL_ID)
         if not log_channel:
-            print(f"Warning: Log channel {LOG_CHANNEL_ID} not found")
+            logger.warning(
+                "Log channel %s not found; cannot post flagged message %s",
+                LOG_CHANNEL_ID,
+                message.id,
+            )
             return
 
         # Build the log message content
@@ -289,9 +419,19 @@ class ExcelsiorBot(discord.Bot):
 
         # Send to log channel (type-check that it's a text channel)
         if not isinstance(log_channel, discord.TextChannel):
-            print(f"Warning: Log channel {LOG_CHANNEL_ID} is not a text channel")
+            logger.warning(
+                "Log channel %s is not a text channel; cannot post flagged message %s",
+                LOG_CHANNEL_ID,
+                message.id,
+            )
             return
         log_message = await log_channel.send(log_content)
+        logger.info(
+            "Posted flagged message %s to log channel %s as message %s",
+            message.id,
+            log_channel.id,
+            log_message.id,
+        )
 
         # Add rating reaction emojis
         rating_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
@@ -316,7 +456,7 @@ class ExcelsiorBot(discord.Bot):
                 db_session.close()
 
 
-    async def moderate_channel(self, channel: discord.TextChannel | discord.Thread) -> bool:
+    async def moderate_channel(self, channel: discord.TextChannel | discord.Thread) -> ModerationResult:
         """
         Moderates a channel by running the moderation workflow on the in-memory message store for that channel.
         
@@ -324,13 +464,30 @@ class ExcelsiorBot(discord.Bot):
             channel: The channel to moderate.
         
         Returns:
-            True when the moderation workflow completes without error.
+            ModerationResult describing the run outcome and any flagged messages.
         """
+        result = ModerationResult(
+            success=False,
+            reason="Moderation did not start.",
+        )
 
         # Copy at time of call to avoid race conditions
         store_history_copy = self.message_store.get_whole_history(channel.id)
 
-        candidates = await get_candidate_features(self.message_store, channel.id, ignore_first_message_count=MESSAGES_PER_CHECK-1)
+        candidates = await get_candidate_features(
+            self.message_store,
+            channel.id,
+            provider=DEFAULT_LLM_PROVIDER,
+            model=DEFAULT_LLM_MODEL,
+            ignore_first_message_count=MESSAGES_PER_CHECK,
+        )
+        result.candidates_considered = len(candidates)
+
+        logger.info(
+            "Retrieved %d moderation candidate(s) for channel %s",
+            len(candidates),
+            channel.id,
+        )
 
         # Filter anything with discusses_ellie > 0.2 since that's likely bot-related noise
         candidates = [candidate for candidate in candidates if candidate["features"]["discusses_ellie"] <= 0.2]
@@ -339,7 +496,14 @@ class ExcelsiorBot(discord.Bot):
         candidates = [c for c in candidates if c.get("discord_message_id") is not None]
 
         if not candidates:
-            return True
+            logger.info(
+                "No candidates with discord_message_id for channel %s; skipping moderation",
+                channel.id,
+            )
+            result.candidates_after_filters = 0
+            result.success = True
+            result.reason = "No candidates with Discord message IDs were found."
+            return result
 
         # Filter out anything directed at a user with the WAIVER_ROLE_NAME role
         candidate_messages = [next((msg for msg in store_history_copy if msg.id == candidate["discord_message_id"]), None) for candidate in candidates]
@@ -362,31 +526,89 @@ class ExcelsiorBot(discord.Bot):
         candidate_messages = filtered_candidate_messages
 
         if not candidates:
-            return True
+            logger.info(
+                "No candidates remain after waiver-role filter for channel %s",
+                channel.id,
+            )
+            result.candidates_after_filters = 0
+            result.success = True
+            result.reason = "No candidates remain after waiver-role filter."
+            return result
 
         # Filter out candidates that are too close to the beginning of the channel history
         # since the model is unlikely to have enough context to extract good features
         # This is redundant, but can't hurt
+        def _safe_message_index(candidate: dict) -> int:
+            # Coerce message_id to int to tolerate string or missing values
+            try:
+                return int(candidate.get("message_id", 0))
+            except (TypeError, ValueError):
+                return 0
+
         candidates = [
             candidate for candidate in candidates
-            if candidate.get("message_id", 0) > MESSAGES_PER_CHECK # message_id is 1-based index
+            if _safe_message_index(candidate) > MESSAGES_PER_CHECK # message_id is 1-based index
         ]
 
         if not candidates:
-            return True
+            logger.info(
+                "No candidates remain after early-history filter for channel %s",
+                channel.id,
+            )
+            result.candidates_after_filters = 0
+            result.success = True
+            result.reason = "No candidates remain after early-history filter."
+            return result
+        
+        result.candidates_after_filters = len(candidates)
             
         # Get the actual message objects for the candidates
         candidate_messages = [next((msg for msg in store_history_copy if msg.id == candidate["discord_message_id"]), None) for candidate in candidates]
 
+        logger.info(
+            "Processing %d filtered candidate(s) for channel %s",
+            len(candidates),
+            channel.id,
+        )
+
         # Load the ML model, checking that it exists first
         model_path = Path("models/lightgbm_model.joblib")
         if not model_path.exists():
-            print(f"Warning: Model file not found at {model_path}, skipping moderation")
-            return False
+            logger.warning(
+                "Model file not found at %s; skipping moderation for channel %s",
+                model_path,
+                channel.id,
+            )
+            result.reason = f"Model file not found at {model_path}"
+            return result
         classifier = load_classifier(model_path)
+        filter_out_feature_names = [] #["discusses_ellie", "includes_positive_takeaways"]
+        # Align feature order with the model's training order; fall back to defaults
+        model_feature_names = getattr(classifier, "feature_names", FEATURE_NAMES)
+        active_feature_names = [
+            name for name in model_feature_names if name not in filter_out_feature_names
+        ]
+        if not active_feature_names:
+            logger.warning(
+                "No active features available for model; skipping moderation for channel %s",
+                channel.id,
+            )
+            result.reason = "No active features available for model."
+            return result
+
+        def _safe_feature_value(raw: Any) -> float:
+            """Convert raw feature to float, defaulting to 0 on bad inputs."""
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return 0.0
+
         feature_matrix = np.array(
             [
-                [float(candidate["features"].get(name, 0.0)) for name in FEATURE_NAMES]
+                [
+                    _safe_feature_value(candidate["features"].get(name, 0.0))
+                    for name in active_feature_names
+                ]
                 for candidate in candidates
             ],
             dtype=float,
@@ -397,11 +619,43 @@ class ExcelsiorBot(discord.Bot):
         
         db_session = self.get_db_session()
         try:
+            # Get message IDs that would be flagged so we can check which already exist
+            candidate_message_ids_to_flag = [
+                candidate_message.id
+                for candidate, candidate_message, prediction in zip(candidates, candidate_messages, predictions)
+                if prediction == "flag" and candidate_message is not None
+            ]
+            
+            # Query for existing flagged message IDs to avoid duplicate inserts
+            existing_flagged_ids: set[int] = set()
+            if candidate_message_ids_to_flag:
+                existing_rows = db_session.query(FlaggedMessage.message_id).filter(
+                    FlaggedMessage.message_id.in_(candidate_message_ids_to_flag)
+                ).all()
+                existing_flagged_ids = {row[0] for row in existing_rows}
+                result.flagged_existing_count = len(existing_flagged_ids)
+                if existing_flagged_ids:
+                    logger.debug(
+                        "Skipping %d already-flagged message(s) for channel %s",
+                        len(existing_flagged_ids),
+                        channel.id,
+                    )
+            
             # Collect all flagged messages first, then commit once at the end
             flagged_messages_to_add: list[FlaggedMessage] = []
             
             for candidate, candidate_message, prediction in zip(candidates, candidate_messages, predictions):
                 if prediction == "flag" and candidate_message is not None:
+                    # Skip if already flagged in database
+                    if candidate_message.id in existing_flagged_ids:
+                        continue
+                    
+                    logger.info(
+                        "Flagging message %s in channel %s (author_id=%s)",
+                        candidate_message.id,
+                        channel.id,
+                        getattr(candidate_message.author, "id", "unknown"),
+                    )
                     await self.flag_message(candidate_message, db_session)
                     surrounding_context = [msg for msg in store_history_copy if msg.id != candidate_message.id]
                     # Serialize surrounding context for persistent storage
@@ -429,13 +683,27 @@ class ExcelsiorBot(discord.Bot):
                     flagged_messages_to_add.append(flagged_message)
             
             # Add all flagged messages and commit once
-            for flagged_message in flagged_messages_to_add:
-                db_session.add(flagged_message)
-            db_session.commit()
+            if flagged_messages_to_add:
+                logger.info(
+                    "Persisting %d flagged message(s) for channel %s",
+                    len(flagged_messages_to_add),
+                    channel.id,
+                )
+                for flagged_message in flagged_messages_to_add:
+                    db_session.add(flagged_message)
+                db_session.commit()
+                result.flagged_new_count = len(flagged_messages_to_add)
+            else:
+                logger.info(
+                    "No messages flagged for channel %s in this moderation pass",
+                    channel.id,
+                )
         finally:
             db_session.close()
 
-        return True
+        result.success = True
+        result.reason = "Moderation completed successfully."
+        return result
 
 
 # Initialize the bot with a command prefix and intents
@@ -475,7 +743,7 @@ async def backfill_threads_for_channel(
     max_messages: int
 ) -> tuple[int, int, list[str]]:
     """
-    Backfill message history for all threads (active and archived) in a channel.
+    Backfill message history for all currently active threads in a channel.
     
     Args:
         channel: The parent channel containing threads.
@@ -489,35 +757,12 @@ async def backfill_threads_for_channel(
     total_messages = 0
     thread_names: list[str] = []
     
-    # Get active threads from the channel's cached threads list
+    # Only backfill active threads from the channel's cached threads list
     for thread in channel.threads:
         count = await backfill_channel_history(thread, message_store, max_messages)
         total_messages += count
         thread_count += 1
         thread_names.append(thread.name)
-    
-    # Get archived threads (both public and private if accessible)
-    try:
-        async for thread in channel.archived_threads(limit=None):
-            count = await backfill_channel_history(thread, message_store, max_messages)
-            total_messages += count
-            thread_count += 1
-            thread_names.append(thread.name)
-    except discord.Forbidden:
-        pass  # Bot doesn't have permission to view archived threads
-    
-    # Try to get private archived threads if we have permission
-    try:
-        async for thread in channel.archived_threads(limit=None, private=True):
-            # Skip if we already processed this thread (it might be in both lists)
-            if message_store.get_most_recent_message(thread.id) is not None:
-                continue
-            count = await backfill_channel_history(thread, message_store, max_messages)
-            total_messages += count
-            thread_count += 1
-            thread_names.append(thread.name)
-    except (discord.Forbidden, TypeError):
-        pass  # Bot doesn't have permission or channel doesn't support private threads
     
     return thread_count, total_messages, thread_names
 
@@ -546,10 +791,19 @@ async def backfill_message_store():
                 total_threads += thread_count
                 total_messages += msg_count
                 total_channels += 1
-                print(f"  Backfilled forum #{channel.name}: {thread_count} threads, {msg_count} messages")
+                logger.info(
+                    "Backfilled forum #%s: %s threads, %s messages",
+                    channel.name,
+                    thread_count,
+                    msg_count,
+                )
                 # Log thread names with their parent forum
                 for name in thread_names:
-                    print(f"    - Thread '{name}' (parent: #{channel.name})")
+                    logger.debug(
+                        "Thread '%s' (parent: #%s) backfilled",
+                        name,
+                        channel.name,
+                    )
                 
             elif isinstance(channel, discord.TextChannel):
                 # Backfill the channel itself
@@ -564,41 +818,56 @@ async def backfill_message_store():
                 total_threads += thread_count
                 total_messages += thread_msgs
                 
-                print(f"  Backfilled #{channel.name}: {msg_count} messages, {thread_count} threads ({thread_msgs} thread messages)")
+                logger.info(
+                    "Backfilled #%s: %s messages, %s threads (%s thread messages)",
+                    channel.name,
+                    msg_count,
+                    thread_count,
+                    thread_msgs,
+                )
                 # Log thread names with their parent channel
                 for name in thread_names:
-                    print(f"    - Thread '{name}' (parent: #{channel.name})")
+                    logger.debug(
+                        "Thread '%s' (parent: #%s) backfilled",
+                        name,
+                        channel.name,
+                    )
     
-    print(f"Backfill complete: {total_channels} channels, {total_threads} threads, {total_messages} total messages")
+    logger.info(
+        "Backfill complete: %s channels, %s threads, %s total messages",
+        total_channels,
+        total_threads,
+        total_messages,
+    )
 
 
 @bot.event
 async def on_ready():
     """Called when the bot has successfully connected to Discord."""
     if bot.user:
-        print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    print(f"Connected to {len(bot.guilds)} guild(s)")
+        logger.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
+    logger.info("Connected to %s guild(s)", len(bot.guilds))
     
     # Initialize database tables
     init_db()
-    print("Database initialized")
+    logger.info("Database initialized")
     
     # Backfill message history for tracked channels and threads
-    print("Backfilling message history...")
+    logger.info("Backfilling message history...")
     await backfill_message_store()
 
     # Kick off moderation schedulers for tracked channels/threads
-    print("Starting moderation schedulers...")
+    logger.info("Starting moderation schedulers...")
     await bot.initialize_moderation_tasks()
 
     # Initialize rating system channel (instructions and leaderboard)
     from cogs.rating import Rating
     rating_cog = bot.get_cog("Rating")
     if rating_cog and isinstance(rating_cog, Rating):
-        print("Initializing rating channel...")
+        logger.info("Initializing rating channel...")
         await rating_cog.init_rating_channel()
     
-    print("Bot is ready!")
+    logger.info("Bot is ready!")
 
 
 def load_cogs():
@@ -613,9 +882,9 @@ def load_cogs():
     for cog in cog_list:
         try:
             bot.load_extension(cog)
-            print(f"Loaded cog: {cog}")
-        except Exception as e:
-            print(f"Failed to load cog {cog}: {e}")
+            logger.info("Loaded cog: %s", cog)
+        except Exception:
+            logger.exception("Failed to load cog %s", cog)
 
 
 if __name__ == "__main__":

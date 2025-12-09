@@ -12,7 +12,7 @@ from discord.ext import commands
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from config import LOG_CHANNEL_ID, RATING_CHANNEL_ID, MODERATOR_ROLES
+from config import RATING_CHANNEL_ID, get_logger
 from database import FlaggedMessage, FlaggedMessageRating, LogChannelRatingPost, RatingCategory
 from utils import format_markdown_table
 
@@ -31,6 +31,9 @@ RATING_EMOJI_ORDER = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
 
 # Path to leaderboard metadata JSON file
 RATING_METADATA_FILE = Path(__file__).parent.parent / "data" / "rating_metadata.json"
+
+# Module-level logger
+logger = get_logger(__name__)
 
 
 def _load_rating_metadata() -> dict:
@@ -90,7 +93,7 @@ class RatingView(discord.ui.View):
             except discord.NotFound:
                 pass
             except discord.HTTPException as e:
-                print(f"[RatingView] Failed to edit timeout message: {e}")
+                logger.warning("Failed to edit timeout message: %s", e)
 
     async def _handle_rating(
         self, interaction: discord.Interaction, category: RatingCategory
@@ -137,6 +140,14 @@ class RatingView(discord.ui.View):
             session.commit()
         finally:
             session.close()
+
+        logger.info(
+            "User %s completed rating %s for flagged message %s (rating_id=%s)",
+            self.user_id,
+            category.value,
+            self.flagged_message_id,
+            rating_id,
+        )
 
         # Update the message
         await interaction.response.edit_message(
@@ -467,6 +478,10 @@ class Rating(commands.Cog):
             )
 
             if not post:
+                logger.debug(
+                    "Reaction on message %s ignored: not a tracked log post",
+                    payload.message_id,
+                )
                 return False
 
             # Look up existing rating to allow overrides instead of ignoring
@@ -487,8 +502,11 @@ class Rating(commands.Cog):
                 existing_rating.category = category
                 existing_rating.completed_at = now
                 session.commit()
-                print(
-                    f"[Rating] User {payload.user_id} updated rating for message {post.flagged_message_id} to {category.value}"
+                logger.info(
+                    "User %s updated rating for flagged message %s to %s",
+                    payload.user_id,
+                    post.flagged_message_id,
+                    category.value,
                 )
             else:
                 # Create a new rating entry for this user/message pair
@@ -504,8 +522,12 @@ class Rating(commands.Cog):
                 session.add(rating)
                 session.commit()
 
-                print(
-                    f"[Rating] User {payload.user_id} rated message {post.flagged_message_id} as {category.value}"
+                logger.info(
+                    "User %s rated flagged message %s as %s (rating_id=%s)",
+                    payload.user_id,
+                    post.flagged_message_id,
+                    category.value,
+                    rating_id,
                 )
 
             # Update leaderboard
@@ -605,7 +627,7 @@ Use `/view_score` to see your personal statistics."""
         """Initialize the rating channel with instructions and leaderboard messages."""
         channel = self.bot.get_channel(RATING_CHANNEL_ID)
         if not channel:
-            print(f"Warning: Rating channel not found: {RATING_CHANNEL_ID}")
+            logger.warning("Rating channel not found: %s", RATING_CHANNEL_ID)
             return
 
         guild = channel.guild if hasattr(channel, "guild") else None
@@ -625,11 +647,18 @@ Use `/view_score` to see your personal statistics."""
                 instructions_message = await channel.fetch_message(instructions_message_id)
                 await instructions_message.edit(content=instructions_content)
             except discord.NotFound:
-                print(f"Instructions message {instructions_message_id} not found, creating new")
+                logger.info(
+                    "Instructions message %s not found; creating new",
+                    instructions_message_id,
+                )
                 metadata.pop("instructions_message_id", None)
                 instructions_message = None
             except Exception as e:
-                print(f"Error refreshing instructions message: {e}")
+                logger.error(
+                    "Error refreshing instructions message %s: %s",
+                    instructions_message_id,
+                    e,
+                )
 
         if instructions_message is None:
             new_msg = await channel.send(instructions_content)
@@ -644,11 +673,18 @@ Use `/view_score` to see your personal statistics."""
                 leaderboard_message = await channel.fetch_message(leaderboard_message_id)
                 await leaderboard_message.edit(content=leaderboard_content)
             except discord.NotFound:
-                print(f"Leaderboard message {leaderboard_message_id} not found, creating new")
+                logger.info(
+                    "Leaderboard message %s not found; creating new",
+                    leaderboard_message_id,
+                )
                 metadata.pop("leaderboard_message_id", None)
                 leaderboard_message = None
             except Exception as e:
-                print(f"Error refreshing leaderboard message: {e}")
+                logger.error(
+                    "Error refreshing leaderboard message %s: %s",
+                    leaderboard_message_id,
+                    e,
+                )
 
         if leaderboard_message is None:
             new_msg = await channel.send(leaderboard_content)
@@ -658,13 +694,15 @@ Use `/view_score` to see your personal statistics."""
         metadata["last_scoreboard"] = scoreboard
         _save_rating_metadata(metadata)
 
-        print("Rating channel initialized. Instructions and leaderboard messages ready.")
+        logger.info(
+            "Rating channel initialized with instructions and leaderboard messages"
+        )
 
     async def update_leaderboard(self) -> None:
         """Update the leaderboard message if the scoreboard has changed."""
         channel = self.bot.get_channel(RATING_CHANNEL_ID)
         if not channel:
-            print(f"Rating channel not found: {RATING_CHANNEL_ID}")
+            logger.warning("Rating channel not found: %s", RATING_CHANNEL_ID)
             return
 
         guild = channel.guild if hasattr(channel, "guild") else None
@@ -679,7 +717,7 @@ Use `/view_score` to see your personal statistics."""
 
         leaderboard_message_id = metadata.get("leaderboard_message_id")
         if not leaderboard_message_id:
-            print("No leaderboard message ID found, reinitializing")
+            logger.warning("No leaderboard message ID found; reinitializing channel")
             await self.init_rating_channel()
             return
 
@@ -690,14 +728,17 @@ Use `/view_score` to see your personal statistics."""
 
             metadata["last_scoreboard"] = new_scoreboard
             _save_rating_metadata(metadata)
-            print("Leaderboard updated successfully")
+            logger.info("Leaderboard updated successfully")
         except discord.NotFound:
-            print(f"Leaderboard message {leaderboard_message_id} not found")
+            logger.warning(
+                "Leaderboard message %s not found; reinitializing channel",
+                leaderboard_message_id,
+            )
             metadata.pop("leaderboard_message_id", None)
             _save_rating_metadata(metadata)
             await self.init_rating_channel()
         except Exception as e:
-            print(f"Error updating leaderboard: {e}")
+            logger.error("Error updating leaderboard %s: %s", leaderboard_message_id, e)
 
     # -------------------------------------------------------------------------
     # Slash Commands
@@ -708,6 +749,11 @@ Use `/view_score` to see your personal statistics."""
         """Present a random flagged message for rating (public channel only)."""
         # Check channel
         if ctx.channel.id != RATING_CHANNEL_ID:
+            logger.info(
+                "/rate invoked outside rating channel by user %s (channel %s)",
+                ctx.author.id,
+                ctx.channel.id,
+            )
             await ctx.respond(
                 "This command can only be used in the rating channel!",
                 ephemeral=True,
@@ -738,6 +784,11 @@ Use `/view_score` to see your personal statistics."""
 
             if not message_record:
                 total_flagged = session.query(FlaggedMessage).count()
+                logger.info(
+                    "/rate invoked by user %s but no flagged messages available (total=%s)",
+                    ctx.author.id,
+                    total_flagged,
+                )
                 await ctx.followup.send(
                     f"No flagged messages available to rate! (Total in system: {total_flagged})",
                     ephemeral=True,
@@ -772,6 +823,13 @@ Use `/view_score` to see your personal statistics."""
                 message_details=message_details,
                 get_db_session=self.get_db_session,
                 on_rating_complete=self.update_leaderboard,
+            )
+
+            logger.info(
+                "/rate served message %s to user %s using method %s",
+                message_record.message_id,
+                ctx.author.id,
+                selection_method,
             )
 
             await ctx.followup.send(content, view=view, ephemeral=True)

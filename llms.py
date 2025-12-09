@@ -7,13 +7,13 @@ from google import genai
 from openai import OpenAI
 
 from config import CEREBRAS_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY
-
-# Timeout for LLM API calls in seconds
-LLM_TIMEOUT_SECONDS = 120.0
 from db_config import get_session
 from history import MessageStore
 from user_stats import get_familiarity_score_stat, get_seniority_scores
 from utils import format_message_history
+
+# Timeout for LLM API calls in seconds
+LLM_TIMEOUT_SECONDS = 120.0
 
 cerebras_client = Cerebras(api_key=CEREBRAS_API_KEY)
 
@@ -104,10 +104,9 @@ CANDIDATE_FEATURES_SCHEMA_GEMINI = _strip_additional_properties(CANDIDATE_FEATUR
 async def extract_features_from_formatted_history(
     formatted_message_history: str,
     channel_name: str,
+    provider: Literal["cerebras", "openrouter", "gemini"],
+    model: str,
     thread_name: str | None = None,
-    provider: Literal["cerebras", "openrouter", "gemini"] = "cerebras",
-    openrouter_model: str = "openai/gpt-oss-120b",
-    gemini_model: str = "gemini-2.5-flash",
     required_message_indexes: list[int] | None = None,
     author_id_map: dict[str, int] | None = None,
     username_id_map: dict[str, int] | None = None,
@@ -120,10 +119,9 @@ async def extract_features_from_formatted_history(
     Args:
         formatted_message_history: The formatted message history string
         channel_name: Name of the Discord channel
-        thread_name: Optional name of the thread if applicable
         provider: Which LLM provider to use ("cerebras", "openrouter", or "gemini")
-        openrouter_model: The model to use when provider is "openrouter"
-        gemini_model: The model to use when provider is "gemini"
+        model: Model identifier to use for the chosen provider
+        thread_name: Optional name of the thread if applicable
         required_message_indexes: Optional list of relative message IDs that MUST have
             features extracted, regardless of whether they appear to be feedback candidates
         author_id_map: Optional mapping of message_id/rel_id strings to author IDs for stat features
@@ -206,7 +204,7 @@ async def extract_features_from_formatted_history(
     4. Output a JSON object matching the provided schema with all candidates and their features.
 
     ### Features (all float values between 0 and 1):
-    - "discusses_ellie": The degree to which "Ellie" is a significant topic of discussion in the message history provided. Ellie's @ mention is "<@1333546604694732892>," which also counts.
+    - "discusses_ellie": The degree to which "Ellie" is a significant topic of discussion for the author of this candidate message. Ellie's @ mention is "<@1333546604694732892>," which also counts.
     - "familiarity_score": How familiar the author of the candidate message seems to be with the target user.
     - "tone_harshness_score": Overall harshness/condescension level independent of content.
     - "positive_framing_score": Does it use positive language ("I like X", "consider trying Y") vs negative ("X is wrong", "your layout is unoptimal")?
@@ -230,6 +228,7 @@ async def extract_features_from_formatted_history(
 
     user_prompt = f"""
     ### Discord context:
+    Server name: Excelsior
     Channel name: {channel_name}
     {f"Thread name: {thread_name}" if thread_name else ""}
 
@@ -251,7 +250,7 @@ async def extract_features_from_formatted_history(
             response: Any = await asyncio.wait_for(
                 asyncio.to_thread(
                     lambda: cerebras_client.chat.completions.create(
-                        model="gpt-oss-120b",
+                        model=model,
                         messages=messages,
                         response_format={
                             "type": "json_schema",
@@ -272,7 +271,7 @@ async def extract_features_from_formatted_history(
             response = await asyncio.wait_for(
                 asyncio.to_thread(
                     lambda: openrouter_client.chat.completions.create(
-                        model=openrouter_model,
+                        model=model,
                         messages=messages,  # type: ignore[arg-type]
                         response_format={
                             "type": "json_schema",
@@ -293,7 +292,7 @@ async def extract_features_from_formatted_history(
             gemini_response = await asyncio.wait_for(
                 asyncio.to_thread(
                     lambda: gemini_client.models.generate_content(
-                        model=gemini_model,
+                        model=model,
                         contents=user_prompt,
                         config=genai.types.GenerateContentConfig(
                             response_mime_type="application/json",
@@ -341,6 +340,8 @@ async def extract_features_from_formatted_history(
 async def get_candidate_features(
     message_store: MessageStore,
     channel_id: int,
+    provider: Literal["cerebras", "openrouter", "gemini"],
+    model: str,
     required_message_indexes: list[int] | None = None,
     ignore_first_message_count: int = 0,
 ) -> list[dict]:
@@ -351,6 +352,8 @@ async def get_candidate_features(
     Args:
         message_store: The MessageStore containing channel history
         channel_id: The Discord channel ID to analyze
+        provider: LLM provider to use ("cerebras", "openrouter", or "gemini")
+        model: Model identifier to use with the provider
         required_message_indexes: Optional list of relative message IDs that MUST have
             features extracted, regardless of whether they appear to be feedback candidates
         ignore_first_message_count: Number of leading messages to treat purely as context when asking the LLM for features
@@ -386,9 +389,11 @@ async def get_candidate_features(
         channel_name = "Unknown Channel"
 
     candidates = await extract_features_from_formatted_history(
-        formatted_message_history,
-        channel_name,
-        thread_name,
+        formatted_message_history=formatted_message_history,
+        channel_name=channel_name,
+        provider=provider,
+        model=model,
+        thread_name=thread_name,
         required_message_indexes=required_message_indexes,
         author_id_map={**message_id_to_author, **{str(k): v for k, v in rel_id_to_author.items()}},
         username_id_map=username_id_map,

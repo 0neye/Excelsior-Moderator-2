@@ -3,7 +3,7 @@
 import discord
 from discord.ext import commands
 from bot import ExcelsiorBot
-from config import LOG_CHANNEL_ID
+from config import LOG_CHANNEL_ID, MODERATOR_ROLES, RATING_CHANNEL_ID
 from history import MessageStore
 from utils import is_tracked_channel
 from user_stats import (
@@ -25,6 +25,22 @@ class Events(commands.Cog):
         # Ensure schema is migrated before realtime updates
         ensure_user_stats_schema()
 
+    def _member_has_moderator_role(self, member: discord.abc.Snowflake) -> bool:
+        """
+        Determine whether a guild member has one of the configured moderator roles.
+
+        Args:
+            member: The guild member to inspect.
+
+        Returns:
+            True when the member possesses a moderator role, False otherwise.
+        """
+        if not isinstance(member, discord.Member):
+            return False
+
+        member_role_names = [role.name for role in member.roles]
+        return any(role_name in MODERATOR_ROLES for role_name in member_role_names)
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         """
@@ -35,6 +51,16 @@ class Events(commands.Cog):
         """
         # Ignore messages from this bot
         if self.bot.user and message.author and message.author.id == self.bot.user.id:
+            return
+
+        # Enforce moderator-only posting in the public rating channel
+        if message.channel.id == RATING_CHANNEL_ID:
+            if not self._member_has_moderator_role(message.author):
+                # Remove unauthorized messages quietly if the bot lacks permissions
+                try:
+                    await message.delete()
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
             return
         
         # Only process messages from allowed channels (including threads in those channels)

@@ -134,10 +134,21 @@ class MessageStore:
     def delete_message(self, message: discord.Message) -> None:
         """
         Delete a message from the store for its channel.
+
+        Args:
+            message: The discord message to remove from the in-memory store.
+
+        Note:
+            We search by ID instead of relying on object identity because delete
+            events can supply a fresh Message instance that differs from the one
+            cached in the deque.
         """
         channel_id = message.channel.id
         channel_deque = self._get_channel_deque(channel_id)
-        channel_deque.remove(message)
+        message_index = next((i for i, stored in enumerate(channel_deque) if stored.id == message.id), None)
+        if message_index is None:
+            return  # Message already evicted or never tracked; safe no-op
+        del channel_deque[message_index]
     
     def delete_message_by_id(self, message_id: int, channel_id: int) -> None:
         """
