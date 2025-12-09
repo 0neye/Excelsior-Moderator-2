@@ -34,7 +34,7 @@ class Events(commands.Cog):
             message: The message that was sent.
         """
         # Ignore messages from this bot
-        if message.author and message.author.id == self.bot.user.id if self.bot.user else None:
+        if self.bot.user and message.author and message.author.id == self.bot.user.id:
             return
         
         # Only process messages from allowed channels (including threads in those channels)
@@ -42,6 +42,8 @@ class Events(commands.Cog):
             return
         
         self.message_store.add_message(message)
+        # Notify moderation scheduler so timers/counts advance from this message
+        await self.bot.notify_moderation_on_message(message)
 
         session = self.get_db_session()
         try:
@@ -63,7 +65,7 @@ class Events(commands.Cog):
             payload: The raw reaction event data.
         """
         # Ignore reactions from this bot
-        if payload.member and payload.member.id == self.bot.user.id if self.bot.user else None:
+        if self.bot.user and payload.user_id == self.bot.user.id:
             return
 
         # Check for log channel rating reactions first
@@ -84,8 +86,11 @@ class Events(commands.Cog):
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             return
         
-        message = await channel.fetch_message(payload.message_id)
-        self.message_store.update_message(message)
+        try:
+            message = await channel.fetch_message(payload.message_id)
+            self.message_store.update_message(message)
+        except discord.NotFound:
+            pass  # Message was deleted before we could fetch it
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
@@ -96,8 +101,8 @@ class Events(commands.Cog):
         Args:
             payload: The raw reaction event data.
         """
-        # Ignore reactions from this bot
-        if payload.member and payload.member.id == self.bot.user.id if self.bot.user else None:
+        # Ignore reactions from this bot (use user_id since member is only on REACTION_ADD)
+        if self.bot.user and payload.user_id == self.bot.user.id:
             return
         
         # Only process reactions in allowed channels (including threads)
@@ -109,8 +114,11 @@ class Events(commands.Cog):
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             return
         
-        message = await channel.fetch_message(payload.message_id)
-        self.message_store.update_message(message)
+        try:
+            message = await channel.fetch_message(payload.message_id)
+            self.message_store.update_message(message)
+        except discord.NotFound:
+            pass  # Message was deleted before we could fetch it
 
     @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message):

@@ -1,5 +1,7 @@
 """Main entry point for the Excelsior Moderator Discord bot."""
 
+import asyncio
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -7,13 +9,23 @@ import discord
 import numpy as np
 from sqlalchemy.orm import Session
 
-from config import DISCORD_BOT_TOKEN, CHANNEL_ALLOW_LIST, MESSAGES_PER_CHECK, WAIVER_ROLE_NAME, REACTION_EMOJI, LOG_CHANNEL_ID
+from pathlib import Path
+
+from config import (
+    DISCORD_BOT_TOKEN,
+    CHANNEL_ALLOW_LIST,
+    MESSAGES_PER_CHECK,
+    WAIVER_ROLE_NAME,
+    REACTION_EMOJI,
+    LOG_CHANNEL_ID,
+    SECS_BETWEEN_AUTO_CHECKS,
+)
 from database import FlaggedMessage, LogChannelRatingPost
 from db_config import init_db, get_session
 from history import MessageStore
 from llms import get_candidate_features
 from ml import FEATURE_NAMES, load_classifier
-from utils import serialize_context_messages
+from utils import serialize_context_messages, is_tracked_channel
 
 # Set up intents for the bot
 intents = discord.Intents.default()
@@ -22,6 +34,21 @@ intents.guilds = True
 intents.members = True
 intents.reactions = True
 intents.message_content = True
+
+
+@dataclass
+class ChannelModerationState:
+    """Keeps moderation scheduling state for a channel or thread."""
+
+    channel_id: int
+    messages_since_check: int = 0
+    has_new_message_since_check: bool = False
+    idle_timer_started_at: datetime | None = None
+    last_checked_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    last_checked_message_id: int | None = None
+    most_recent_message_id: int | None = None
+    trigger_event: asyncio.Event = field(default_factory=asyncio.Event)
+    task: asyncio.Task | None = None
 
 
 class ExcelsiorBot(discord.Bot):
@@ -33,6 +60,199 @@ class ExcelsiorBot(discord.Bot):
         self.message_store: MessageStore = MessageStore()
         # Function to get DB sessions
         self.get_db_session: Callable[[], Session] = get_session
+        # Per-channel moderation scheduler state
+        self.channel_states: dict[int, ChannelModerationState] = {}
+
+    def _get_or_create_channel_state(self, channel_id: int) -> ChannelModerationState:
+        """
+        Return existing channel state or create a new one with defaults.
+        
+        Args:
+            channel_id: The Discord channel/thread ID.
+            
+        Returns:
+            ChannelModerationState: Mutable state for scheduling moderation.
+        """
+        if channel_id not in self.channel_states:
+            self.channel_states[channel_id] = ChannelModerationState(channel_id=channel_id)
+        return self.channel_states[channel_id]
+
+    def _compute_idle_timeout(self, state: ChannelModerationState) -> float | None:
+        """
+        Calculate seconds remaining before the idle timer should trigger moderation.
+        
+        Args:
+            state: Channel moderation state to inspect.
+            
+        Returns:
+            Seconds remaining or None when no idle timer is running.
+        """
+        if not (state.has_new_message_since_check and state.idle_timer_started_at):
+            return None
+        elapsed = (datetime.now(timezone.utc) - state.idle_timer_started_at).total_seconds()
+        remaining = SECS_BETWEEN_AUTO_CHECKS - elapsed
+        return remaining
+
+    def _should_moderate(self, state: ChannelModerationState) -> bool:
+        """
+        Decide if the moderation workflow should run based on counters and timers.
+        
+        Args:
+            state: Channel moderation state to evaluate.
+            
+        Returns:
+            True when thresholds are met, False otherwise.
+        """
+        if state.messages_since_check >= MESSAGES_PER_CHECK:
+            return True
+        remaining = self._compute_idle_timeout(state)
+        if remaining is not None and remaining <= 0:
+            return True
+        return False
+
+    def _ensure_scheduler_task(self, channel: discord.TextChannel | discord.Thread) -> None:
+        """
+        Ensure a scheduler task exists for a tracked channel/thread.
+        
+        Args:
+            channel: The channel or thread requiring a scheduler.
+        """
+        if not is_tracked_channel(channel):
+            return
+        # Skip forum parents; they only contain threads
+        if isinstance(channel, discord.ForumChannel):
+            return
+        state = self._get_or_create_channel_state(channel.id)
+        # If an existing task is alive, nothing to do
+        if state.task and not state.task.done():
+            return
+
+        async def _runner(channel_id: int):
+            try:
+                await self._moderation_scheduler(channel_id)
+            except asyncio.CancelledError:
+                # Allow graceful shutdown without noisy tracebacks
+                return
+            except Exception as exc:
+                print(f"Scheduler for channel {channel_id} crashed: {exc}")
+
+        state.task = asyncio.create_task(_runner(channel.id))
+
+    async def _run_moderation(
+        self,
+        channel: discord.TextChannel | discord.Thread,
+        state: ChannelModerationState,
+    ) -> None:
+        """
+        Run moderate_channel and update state on completion.
+        
+        Args:
+            channel: Target channel or thread.
+            state: Channel state to reset after completion.
+        """
+        success = await self.moderate_channel(channel)
+
+        if success:
+            # Reset counters after a successful moderation pass
+            state.messages_since_check = 0
+            state.has_new_message_since_check = False
+            state.idle_timer_started_at = None
+            state.last_checked_at = datetime.now(timezone.utc)
+            recent_message = self.message_store.get_most_recent_message(channel.id)
+            state.last_checked_message_id = recent_message.id if recent_message else None
+
+    async def _moderation_scheduler(self, channel_id: int) -> None:
+        """
+        Scheduler loop that triggers moderation based on message count or idle time.
+        
+        Args:
+            channel_id: The channel or thread ID this scheduler manages.
+        """
+        state = self._get_or_create_channel_state(channel_id)
+        while True:
+            # Quick check: if thresholds are already met, skip waiting
+            if not self._should_moderate(state):
+                timeout = self._compute_idle_timeout(state)
+                state.trigger_event.clear()
+                try:
+                    if timeout is None:
+                        await state.trigger_event.wait()
+                    elif timeout <= 0:
+                        # Timer already expired; fall through to evaluation
+                        pass
+                    else:
+                        await asyncio.wait_for(state.trigger_event.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    # Idle timer fired
+                    pass
+                except asyncio.CancelledError:
+                    raise
+                finally:
+                    # Ensure event is cleared so new messages can wake the loop
+                    state.trigger_event.clear()
+
+            if not self._should_moderate(state):
+                # Nothing to do yet; loop back to wait for next signal
+                continue
+
+            channel = self.get_channel(channel_id)
+            if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+                # Channel unavailable; pause until next activity
+                state.has_new_message_since_check = False
+                state.messages_since_check = 0
+                state.idle_timer_started_at = None
+                continue
+
+            try:
+                await self._run_moderation(channel, state)
+            except Exception as exc:
+                # Log and continue loop so the scheduler keeps running
+                print(f"Moderation run failed for channel {channel_id}: {exc}")
+
+    async def notify_moderation_on_message(self, message: discord.Message) -> None:
+        """
+        Record new message activity and wake the scheduler for the message's channel.
+        
+        Args:
+            message: The new Discord message.
+        """
+        channel = message.channel
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return
+        if not is_tracked_channel(channel):
+            return
+
+        self._ensure_scheduler_task(channel)
+        state = self._get_or_create_channel_state(channel.id)
+        state.messages_since_check += 1
+        state.most_recent_message_id = message.id
+        # Only start the idle timer and flag once per post-check batch
+        if not state.has_new_message_since_check:
+            state.has_new_message_since_check = True
+            state.idle_timer_started_at = datetime.now(timezone.utc)
+
+        # Wake scheduler to consider thresholds immediately
+        state.trigger_event.set()
+
+    async def initialize_moderation_tasks(self) -> None:
+        """
+        Ensure schedulers are running for all tracked channels and threads seen at startup.
+        """
+        # Start tasks for allowed parent channels present in guilds
+        for guild in self.guilds:
+            for channel_id in CHANNEL_ALLOW_LIST:
+                channel = guild.get_channel(channel_id)
+                if isinstance(channel, discord.ForumChannel):
+                    # Forum parents are skipped; their threads are handled separately
+                    continue
+                if isinstance(channel, (discord.TextChannel, discord.Thread)):
+                    self._ensure_scheduler_task(channel)
+
+        # Start tasks for any threads or channels discovered during backfill
+        for channel_id in self.message_store.get_all_channel_info().keys():
+            channel = self.get_channel(channel_id)
+            if isinstance(channel, (discord.TextChannel, discord.Thread)) and is_tracked_channel(channel):
+                self._ensure_scheduler_task(channel)
     
 
     async def flag_message(self, message: discord.Message, db_session=None) -> None:
@@ -96,12 +316,15 @@ class ExcelsiorBot(discord.Bot):
                 db_session.close()
 
 
-    async def moderate_channel(self, channel: discord.TextChannel | discord.Thread) -> None:
+    async def moderate_channel(self, channel: discord.TextChannel | discord.Thread) -> bool:
         """
         Moderates a channel by running the moderation workflow on the in-memory message store for that channel.
         
         Args:
             channel: The channel to moderate.
+        
+        Returns:
+            True when the moderation workflow completes without error.
         """
 
         # Copy at time of call to avoid race conditions
@@ -112,23 +335,34 @@ class ExcelsiorBot(discord.Bot):
         # Filter anything with discusses_ellie > 0.2 since that's likely bot-related noise
         candidates = [candidate for candidate in candidates if candidate["features"]["discusses_ellie"] <= 0.2]
 
+        # Filter out candidates that don't have a resolved discord_message_id
+        candidates = [c for c in candidates if c.get("discord_message_id") is not None]
+
         if not candidates:
-            return
+            return True
 
         # Filter out anything directed at a user with the WAIVER_ROLE_NAME role
         candidate_messages = [next((msg for msg in store_history_copy if msg.id == candidate["discord_message_id"]), None) for candidate in candidates]
 
         candidate_message_authors = [message.author for message in candidate_messages if message is not None]
 
+        # Build a filtered list to avoid mutating while iterating
+        filtered_candidates: list[dict] = []
+        filtered_candidate_messages: list[discord.Message | None] = []
         for candidate, message_author in zip(candidates, candidate_message_authors):
-            # Check if author is a Member with roles (not a User)
             if isinstance(message_author, discord.Member) and message_author.roles:
                 if any(role.name == WAIVER_ROLE_NAME for role in message_author.roles):
-                    candidates.remove(candidate)
+                    continue
+            filtered_candidates.append(candidate)
+            filtered_candidate_messages.append(
+                next((msg for msg in store_history_copy if msg.id == candidate["discord_message_id"]), None)
+            )
 
+        candidates = filtered_candidates
+        candidate_messages = filtered_candidate_messages
 
         if not candidates:
-            return
+            return True
 
         # Filter out candidates that are too close to the beginning of the channel history
         # since the model is unlikely to have enough context to extract good features
@@ -139,13 +373,17 @@ class ExcelsiorBot(discord.Bot):
         ]
 
         if not candidates:
-            return
+            return True
             
         # Get the actual message objects for the candidates
         candidate_messages = [next((msg for msg in store_history_copy if msg.id == candidate["discord_message_id"]), None) for candidate in candidates]
 
-        # Then send to the ml pipeline
-        classifier = load_classifier("models/lightgbm_model.joblib")
+        # Load the ML model, checking that it exists first
+        model_path = Path("models/lightgbm_model.joblib")
+        if not model_path.exists():
+            print(f"Warning: Model file not found at {model_path}, skipping moderation")
+            return False
+        classifier = load_classifier(model_path)
         feature_matrix = np.array(
             [
                 [float(candidate["features"].get(name, 0.0)) for name in FEATURE_NAMES]
@@ -159,7 +397,10 @@ class ExcelsiorBot(discord.Bot):
         
         db_session = self.get_db_session()
         try:
-            for candidate_message, prediction in zip(candidate_messages, predictions):
+            # Collect all flagged messages first, then commit once at the end
+            flagged_messages_to_add: list[FlaggedMessage] = []
+            
+            for candidate, candidate_message, prediction in zip(candidates, candidate_messages, predictions):
                 if prediction == "flag" and candidate_message is not None:
                     await self.flag_message(candidate_message, db_session)
                     surrounding_context = [msg for msg in store_history_copy if msg.id != candidate_message.id]
@@ -179,19 +420,22 @@ class ExcelsiorBot(discord.Bot):
                         content=candidate_message.content,
                         context_message_ids=context_ids,
                         context_messages=serialized_context,
-                    # Store native datetimes to match the ORM schema
-                    timestamp=candidate_message.created_at if candidate_message.created_at else None,
-                    flagged_at=datetime.now(timezone.utc),
+                        # Store native datetimes to match the ORM schema
+                        timestamp=candidate_message.created_at if candidate_message.created_at else datetime.now(timezone.utc),
+                        flagged_at=datetime.now(timezone.utc),
                         target_user_id=candidate.get("target_user_id"),
                         target_username=candidate.get("target_username"),
                     )
-                    db_session.add(flagged_message)
-                    db_session.commit()
-                elif prediction == "no_flag":
-                    pass
+                    flagged_messages_to_add.append(flagged_message)
+            
+            # Add all flagged messages and commit once
+            for flagged_message in flagged_messages_to_add:
+                db_session.add(flagged_message)
+            db_session.commit()
         finally:
             db_session.close()
 
+        return True
 
 
 # Initialize the bot with a command prefix and intents
@@ -342,6 +586,10 @@ async def on_ready():
     # Backfill message history for tracked channels and threads
     print("Backfilling message history...")
     await backfill_message_store()
+
+    # Kick off moderation schedulers for tracked channels/threads
+    print("Starting moderation schedulers...")
+    await bot.initialize_moderation_tasks()
 
     # Initialize rating system channel (instructions and leaderboard)
     from cogs.rating import Rating

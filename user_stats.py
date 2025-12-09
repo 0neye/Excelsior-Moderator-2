@@ -61,6 +61,7 @@ def _get_or_create_user_stats(
 ) -> UserStats:
     """
     Fetch or create a UserStats row, updating stored names if they changed.
+    Uses savepoints to avoid rolling back entire transaction on IntegrityError.
     """
     # Check pending objects first to avoid duplicate inserts within the same session
     for pending in session.new:
@@ -80,13 +81,14 @@ def _get_or_create_user_stats(
             message_count=0,
             character_count=0,
         )
-        session.add(user_stats)
+        # Use savepoint so IntegrityError only rolls back this insert, not entire session
+        savepoint = session.begin_nested()
         try:
-            # Flush immediately to catch IntegrityError if user already exists in DB
+            session.add(user_stats)
             session.flush()
         except IntegrityError:
-            # User was inserted by another session/run; roll back and re-query
-            session.rollback()
+            # User was inserted by another session/run; rollback savepoint and re-query
+            savepoint.rollback()
             user_stats = session.query(UserStats).filter_by(user_id=user_id).first()
             if user_stats is None:
                 raise
@@ -101,6 +103,7 @@ def _get_or_create_user_stats(
 def _get_or_create_co_occurrence(session: Session, user_a_id: int, user_b_id: int) -> UserCoOccurrence:
     """
     Fetch or create a co-occurrence row for an unordered pair (lowest id first).
+    Uses savepoints to avoid rolling back entire transaction on IntegrityError.
     """
     if user_a_id == user_b_id:
         raise ValueError("Co-occurrence pair must involve two distinct users")
@@ -122,12 +125,14 @@ def _get_or_create_co_occurrence(session: Session, user_a_id: int, user_b_id: in
     )
     if pair is None:
         pair = UserCoOccurrence(user_a_id=low_id, user_b_id=high_id, co_occurrence_count=0)
-        session.add(pair)
+        # Use savepoint so IntegrityError only rolls back this insert, not entire session
+        savepoint = session.begin_nested()
         try:
-            # Flush so subsequent lookups in this session find the row
+            session.add(pair)
             session.flush()
         except IntegrityError:
-            session.rollback()
+            # Pair was inserted by another session/run; rollback savepoint and re-query
+            savepoint.rollback()
             pair = (
                 session.query(UserCoOccurrence)
                 .filter_by(user_a_id=low_id, user_b_id=high_id)

@@ -53,7 +53,7 @@ class RatingView(discord.ui.View):
 
     def __init__(
         self,
-        flagged_message: FlaggedMessage,
+        flagged_message_id: int,
         user_id: int,
         message_details: str,
         get_db_session,
@@ -63,14 +63,15 @@ class RatingView(discord.ui.View):
         Initialize the rating view.
 
         Args:
-            flagged_message: The flagged message being rated.
+            flagged_message_id: The message_id of the flagged message being rated.
             user_id: Discord ID of the rater.
             message_details: Pre-formatted message details to display.
             get_db_session: Function to get DB sessions.
             on_rating_complete: Callback when rating is submitted.
         """
         super().__init__(timeout=300)  # 5 minute timeout
-        self.flagged_message = flagged_message
+        # Store only the ID to avoid detached session issues
+        self.flagged_message_id = flagged_message_id
         self.user_id = user_id
         self.message_details = message_details
         self.get_db_session = get_db_session
@@ -118,7 +119,7 @@ class RatingView(discord.ui.View):
         self._interaction = interaction
 
         # Generate unique rating ID
-        rating_id = f"{self.user_id}_{self.flagged_message.message_id}_{uuid.uuid4().hex[:8]}"
+        rating_id = f"{self.user_id}_{self.flagged_message_id}_{uuid.uuid4().hex[:8]}"
 
         # Save rating to DB
         session = self.get_db_session()
@@ -126,7 +127,7 @@ class RatingView(discord.ui.View):
             now = datetime.now(timezone.utc)
             rating = FlaggedMessageRating(
                 rating_id=rating_id,
-                flagged_message_id=self.flagged_message.message_id,
+                flagged_message_id=self.flagged_message_id,
                 rater_user_id=self.user_id,
                 category=category,
                 started_at=now,
@@ -766,7 +767,7 @@ Use `/view_score` to see your personal statistics."""
             )
 
             view = RatingView(
-                flagged_message=message_record,
+                flagged_message_id=message_record.message_id,
                 user_id=ctx.author.id,
                 message_details=message_details,
                 get_db_session=self.get_db_session,

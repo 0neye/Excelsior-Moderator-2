@@ -246,7 +246,10 @@ class LightGBMClassifier(ModerationClassifier):
             raise ValueError("Model must be fitted before getting feature importance")
 
         importances = self.model.feature_importances_
-        importances = importances / importances.sum()
+        # Avoid division by zero if all importances are zero
+        total = importances.sum()
+        if total > 0:
+            importances = importances / total
         feature_names = getattr(self, "feature_names", FEATURE_NAMES)
 
         return dict(zip(feature_names, importances))

@@ -7,6 +7,9 @@ from google import genai
 from openai import OpenAI
 
 from config import CEREBRAS_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY
+
+# Timeout for LLM API calls in seconds
+LLM_TIMEOUT_SECONDS = 120.0
 from db_config import get_session
 from history import MessageStore
 from user_stats import get_familiarity_score_stat, get_seniority_scores
@@ -242,72 +245,95 @@ async def extract_features_from_formatted_history(
         {"role": "user", "content": user_prompt}
     ]
 
-    if provider == "cerebras":
-        # Run synchronous Cerebras API call in a thread pool to avoid blocking
-        response: Any = await asyncio.to_thread(
-            lambda: cerebras_client.chat.completions.create(
-                model="gpt-oss-120b",
-                messages=messages,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "candidate_features",
-                        "strict": True,
-                        "schema": CANDIDATE_FEATURES_SCHEMA
-                    }
-                },
-                stream=False,
-                max_completion_tokens=65536,
+    try:
+        if provider == "cerebras":
+            # Run synchronous Cerebras API call in a thread pool with timeout
+            response: Any = await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: cerebras_client.chat.completions.create(
+                        model="gpt-oss-120b",
+                        messages=messages,
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "candidate_features",
+                                "strict": True,
+                                "schema": CANDIDATE_FEATURES_SCHEMA
+                            }
+                        },
+                        stream=False,
+                        max_completion_tokens=65536,
+                    )
+                ),
+                timeout=LLM_TIMEOUT_SECONDS,
             )
-        )
-    elif provider == "openrouter":
-        # Run synchronous OpenRouter API call in a thread pool to avoid blocking
-        # Cast messages to Any since OpenAI SDK has strict typing
-        response = await asyncio.to_thread(
-            lambda: openrouter_client.chat.completions.create(
-                model=openrouter_model,
-                messages=messages,  # type: ignore[arg-type]
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "candidate_features",
-                        "strict": True,
-                        "schema": CANDIDATE_FEATURES_SCHEMA
-                    }
-                },
-                max_tokens=65536,
-                extra_body={"reasoning": {"enabled": True}}
+        elif provider == "openrouter":
+            # Run synchronous OpenRouter API call in a thread pool with timeout
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: openrouter_client.chat.completions.create(
+                        model=openrouter_model,
+                        messages=messages,  # type: ignore[arg-type]
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "candidate_features",
+                                "strict": True,
+                                "schema": CANDIDATE_FEATURES_SCHEMA
+                            }
+                        },
+                        max_tokens=65536,
+                        extra_body={"reasoning": {"enabled": True}}
+                    )
+                ),
+                timeout=LLM_TIMEOUT_SECONDS,
             )
-        )
-    elif provider == "gemini":
-        
-        # Run synchronous Gemini API call in a thread pool to avoid blocking
-        gemini_response = await asyncio.to_thread(
-            lambda: gemini_client.models.generate_content(
-                model=gemini_model,
-                contents=user_prompt,
-                config=genai.types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=CANDIDATE_FEATURES_SCHEMA_GEMINI,
-                    system_instruction=system_prompt
-                )
+        elif provider == "gemini":
+            # Run synchronous Gemini API call in a thread pool with timeout
+            gemini_response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: gemini_client.models.generate_content(
+                        model=gemini_model,
+                        contents=user_prompt,
+                        config=genai.types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=CANDIDATE_FEATURES_SCHEMA_GEMINI,
+                            system_instruction=system_prompt
+                        )
+                    )
+                ),
+                timeout=LLM_TIMEOUT_SECONDS,
             )
-        )
-        
-        # Parse the Gemini response directly
-        gemini_content = gemini_response.text
-        if gemini_content is None:
-            raise ValueError("Gemini returned empty response")
-        gemini_result: dict[str, Any] = json.loads(gemini_content)
-        candidates = gemini_result["candidates"]
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
+            
+            # Parse the Gemini response directly
+            gemini_content = gemini_response.text
+            if gemini_content is None:
+                raise ValueError("Gemini returned empty response")
+            try:
+                gemini_result: dict[str, Any] = json.loads(gemini_content)
+                candidates = gemini_result["candidates"]
+            except (json.JSONDecodeError, KeyError) as e:
+                raise ValueError(f"Failed to parse Gemini response: {e}") from e
+        else:
+            raise ValueError(f"Unknown provider: {provider}")
 
-    if provider in {"cerebras", "openrouter"}:
-        # Parse the structured JSON response
-        content: str = response.choices[0].message.content
-        result: dict[str, Any] = json.loads(content)
-        candidates = result["candidates"]
+        if provider in {"cerebras", "openrouter"}:
+            # Parse the structured JSON response with error handling
+            if not response.choices:
+                raise ValueError(f"{provider} returned no choices in response")
+            content: str | None = response.choices[0].message.content
+            if content is None:
+                raise ValueError(f"{provider} returned empty message content")
+            try:
+                result: dict[str, Any] = json.loads(content)
+                candidates = result["candidates"]
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Failed to parse {provider} JSON response: {e}") from e
+            except KeyError:
+                raise ValueError(f"{provider} response missing 'candidates' key")
+
+    except asyncio.TimeoutError:
+        raise TimeoutError(f"LLM API call to {provider} timed out after {LLM_TIMEOUT_SECONDS}s")
 
     return _augment_stat_features(candidates)
 
