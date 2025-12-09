@@ -3,6 +3,7 @@
 import discord
 from discord.ext import commands
 from bot import ExcelsiorBot
+from config import LOG_CHANNEL_ID
 from history import MessageStore
 from utils import is_tracked_channel
 from user_stats import (
@@ -64,6 +65,15 @@ class Events(commands.Cog):
         # Ignore reactions from this bot
         if payload.member and payload.member.id == self.bot.user.id if self.bot.user else None:
             return
+
+        # Check for log channel rating reactions first
+        if payload.channel_id == LOG_CHANNEL_ID:
+            from cogs.rating import Rating
+            rating_cog = self.bot.get_cog("Rating")
+            if rating_cog and isinstance(rating_cog, Rating):
+                handled = await rating_cog.handle_log_channel_reaction(payload)
+                if handled:
+                    return
         
         # Only process reactions in allowed channels (including threads)
         channel = self.bot.get_channel(payload.channel_id)

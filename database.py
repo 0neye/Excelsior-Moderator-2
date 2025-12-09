@@ -97,6 +97,27 @@ class FlaggedMessageRating(Base):
     completed_at = Column(DateTime, nullable=True)
 
 
+class LogChannelRatingPost(Base):
+    """
+    Maps bot messages in the log channel to flagged messages for reaction-based rating.
+    
+    When a message is flagged, the bot posts to the log channel with emoji reactions
+    (1-5) for moderators to rate. This table tracks which bot message corresponds
+    to which flagged message.
+    """
+    __tablename__ = "log_channel_rating_posts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    bot_message_id = Column(BigInteger, unique=True, nullable=False, index=True)
+    flagged_message_id = Column(
+        BigInteger,
+        ForeignKey("flagged_messages.message_id"),
+        nullable=False,
+        index=True
+    )
+    posted_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
 class DictionaryEntry(Base):
     """
     Stores dictionary entries for terms with short and long descriptions.

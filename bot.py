@@ -7,8 +7,8 @@ import discord
 import numpy as np
 from sqlalchemy.orm import Session
 
-from config import DISCORD_BOT_TOKEN, CHANNEL_ALLOW_LIST, MESSAGES_PER_CHECK, WAIVER_ROLE_NAME, REACTION_EMOJI
-from database import FlaggedMessage
+from config import DISCORD_BOT_TOKEN, CHANNEL_ALLOW_LIST, MESSAGES_PER_CHECK, WAIVER_ROLE_NAME, REACTION_EMOJI, LOG_CHANNEL_ID
+from database import FlaggedMessage, LogChannelRatingPost
 from db_config import init_db, get_session
 from history import MessageStore
 from llms import get_candidate_features
@@ -35,12 +35,65 @@ class ExcelsiorBot(discord.Bot):
         self.get_db_session: Callable[[], Session] = get_session
     
 
-    async def flag_message(self, message: discord.Message) -> None:
+    async def flag_message(self, message: discord.Message, db_session=None) -> None:
         """
-        Flags a message by adding a reaction to it.
-        TODO: also add a log message to the mod channel
+        Flags a message by adding a reaction and posting to the log channel for mod rating.
+
+        Args:
+            message: The Discord message to flag.
+            db_session: Optional DB session. If not provided, creates one internally.
         """
+        # Add reaction to the original message
         await message.add_reaction(REACTION_EMOJI)
+
+        # Post to log channel for mod rating
+        log_channel = self.get_channel(LOG_CHANNEL_ID)
+        if not log_channel:
+            print(f"Warning: Log channel {LOG_CHANNEL_ID} not found")
+            return
+
+        # Build the log message content
+        author_name = message.author.display_name or message.author.name
+        jump_url = message.jump_url
+        content_preview = (message.content or "")[:500]
+        if len(message.content or "") > 500:
+            content_preview += "..."
+
+        log_content = (
+            f"**Flagged Message**\n"
+            f"**Author:** {author_name}\n"
+            f"**Link:** {jump_url}\n"
+            f"**Content:**\n```\n{content_preview}\n```\n"
+            f"React with: 1️⃣ No Flag | 2️⃣ Ambiguous | 3️⃣ Unconstructive | 4️⃣ Unsolicited | 5️⃣ N/A"
+        )
+
+        # Send to log channel (type-check that it's a text channel)
+        if not isinstance(log_channel, discord.TextChannel):
+            print(f"Warning: Log channel {LOG_CHANNEL_ID} is not a text channel")
+            return
+        log_message = await log_channel.send(log_content)
+
+        # Add rating reaction emojis
+        rating_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+        for emoji in rating_emojis:
+            await log_message.add_reaction(emoji)
+
+        # Store the mapping in DB
+        close_session = False
+        if db_session is None:
+            db_session = self.get_db_session()
+            close_session = True
+
+        try:
+            post = LogChannelRatingPost(
+                bot_message_id=log_message.id,
+                flagged_message_id=message.id,
+            )
+            db_session.add(post)
+            db_session.commit()
+        finally:
+            if close_session:
+                db_session.close()
 
 
     async def moderate_channel(self, channel: discord.TextChannel | discord.Thread) -> None:
@@ -68,8 +121,10 @@ class ExcelsiorBot(discord.Bot):
         candidate_message_authors = [message.author for message in candidate_messages if message is not None]
 
         for candidate, message_author in zip(candidates, candidate_message_authors):
-            if message_author.roles and any(role.name == WAIVER_ROLE_NAME for role in message_author.roles):
-                candidates.remove(candidate)
+            # Check if author is a Member with roles (not a User)
+            if isinstance(message_author, discord.Member) and message_author.roles:
+                if any(role.name == WAIVER_ROLE_NAME for role in message_author.roles):
+                    candidates.remove(candidate)
 
 
         if not candidates:
@@ -103,32 +158,39 @@ class ExcelsiorBot(discord.Bot):
         predictions = classifier.predict(feature_matrix)
         
         db_session = self.get_db_session()
+        try:
+            for candidate_message, prediction in zip(candidate_messages, predictions):
+                if prediction == "flag" and candidate_message is not None:
+                    await self.flag_message(candidate_message, db_session)
+                    surrounding_context = [msg for msg in store_history_copy if msg.id != candidate_message.id]
+                    # Serialize surrounding context for persistent storage
+                    context_ids, serialized_context = serialize_context_messages(surrounding_context)
 
-        for candidate_message, prediction in zip(candidate_messages, predictions):
-            if prediction == "flag" and candidate_message is not None:
-                await self.flag_message(candidate_message)
-                surrounding_context = [msg for msg in store_history_copy if msg.id != candidate_message.id]
-                # Serialize surrounding context for persistent storage
-                context_ids, serialized_context = serialize_context_messages(surrounding_context)
-
-                flagged_message = FlaggedMessage(
-                    message_id=candidate_message.id,
-                    channel_id=channel.id,
-                    guild_id=channel.guild.id,
-                    author_id=candidate_message.author.id,
-                    author_username=candidate_message.author.name,
-                    content=candidate_message.content,
-                    context_message_ids=context_ids,
-                    context_messages=serialized_context,
-                    timestamp=candidate_message.created_at.isoformat() if candidate_message.created_at else None,
-                    flagged_at=datetime.now(timezone.utc).isoformat(),
-                    target_user_id=candidate.get("target_user_id"),
-                    target_username=candidate.get("target_username"),
-                )
-                db_session.add(flagged_message)
-                db_session.commit()
-            elif prediction == "no_flag":
-                pass
+                    flagged_message = FlaggedMessage(
+                        message_id=candidate_message.id,
+                        channel_id=channel.id,
+                        guild_id=channel.guild.id,
+                        author_id=candidate_message.author.id,
+                        # Store both display_name and username for user-friendly rendering
+                        author_display_name=getattr(
+                            candidate_message.author, "display_name", None
+                        ),
+                        author_username=candidate_message.author.name,
+                        content=candidate_message.content,
+                        context_message_ids=context_ids,
+                        context_messages=serialized_context,
+                    # Store native datetimes to match the ORM schema
+                    timestamp=candidate_message.created_at if candidate_message.created_at else None,
+                    flagged_at=datetime.now(timezone.utc),
+                        target_user_id=candidate.get("target_user_id"),
+                        target_username=candidate.get("target_username"),
+                    )
+                    db_session.add(flagged_message)
+                    db_session.commit()
+                elif prediction == "no_flag":
+                    pass
+        finally:
+            db_session.close()
 
 
 
@@ -280,6 +342,13 @@ async def on_ready():
     # Backfill message history for tracked channels and threads
     print("Backfilling message history...")
     await backfill_message_store()
+
+    # Initialize rating system channel (instructions and leaderboard)
+    from cogs.rating import Rating
+    rating_cog = bot.get_cog("Rating")
+    if rating_cog and isinstance(rating_cog, Rating):
+        print("Initializing rating channel...")
+        await rating_cog.init_rating_channel()
     
     print("Bot is ready!")
 
@@ -290,6 +359,7 @@ def load_cogs():
         "cogs.public",
         "cogs.restricted",
         "cogs.events",
+        "cogs.rating",
     ]
     
     for cog in cog_list:
