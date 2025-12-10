@@ -148,8 +148,8 @@ class LightGBMClassifier(ModerationClassifier):
 
     def __init__(
         self,
-        n_estimators: int = 100,
-        max_depth: int = 7,
+        n_estimators: int = 200,
+        max_depth: int = 6,
         learning_rate: float = 0.1,
         num_leaves: int = 50,
         class_weight: str | dict | None = "balanced",
