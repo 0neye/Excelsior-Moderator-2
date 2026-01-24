@@ -1,5 +1,5 @@
 """
-ZipApp - Creates a zip archive containing all Git-tracked files, the database file, and environment variables.
+ZipApp - Creates a zip archive containing all Git-tracked files, the database file, environment variables, the lightgbm model, and rating metadata.
 Uses Git itself to determine which files to include, ensuring robustness and consistency with version control.
 """
 
@@ -47,7 +47,7 @@ def get_git_tracked_files(root_path):
 
 def create_zip_archive(output_name='excelsior_bot.zip'):
     """
-    Create a zip archive containing all Git-tracked files, the database file, and .env file.
+    Create a zip archive containing all Git-tracked files, the database file, .env file, lightgbm model, and rating metadata.
     
     Args:
         output_name: Name of the output zip file
@@ -82,6 +82,24 @@ def create_zip_archive(output_name='excelsior_bot.zip'):
             print(f"Added environment file: {env_file.name}")
     else:
         print(f"Warning: Environment file {env_file.name} not found.")
+    
+    # Add lightgbm model file if it exists
+    model_file = root_path / 'models' / 'lightgbm_model.joblib'
+    if model_file.exists():
+        if model_file not in files_to_include:
+            files_to_include.append(model_file)
+            print(f"Added model file: {model_file.relative_to(root_path)}")
+    else:
+        print(f"Warning: Model file {model_file.relative_to(root_path)} not found.")
+    
+    # Add rating metadata file if it exists
+    rating_metadata_file = root_path / 'data' / 'rating_metadata.json'
+    if rating_metadata_file.exists():
+        if rating_metadata_file not in files_to_include:
+            files_to_include.append(rating_metadata_file)
+            print(f"Added rating metadata file: {rating_metadata_file.relative_to(root_path)}")
+    else:
+        print(f"Warning: Rating metadata file {rating_metadata_file.relative_to(root_path)} not found.")
     
     # Skip the zip file itself if it exists
     zip_path = root_path / output_name
