@@ -37,11 +37,15 @@ DB_FILE = "excelsior.db"
 MESSAGES_PER_CHECK = 30
 
 # How many messages of history to send to the llm for analysis
-HISTORY_PER_CHECK = 60
+HISTORY_PER_CHECK = 40
 
 # If there are new messages in a channel that haven't been checked, but not enough to trigger the above, check anyway after this time
 # Resets after a new message, and doesn't trigger if all messages in channel have already been checked
 SECS_BETWEEN_AUTO_CHECKS = 240
+
+# Backoff settings for failed moderation runs to prevent rapid retries.
+MODERATION_FAILURE_BACKOFF_BASE = 30
+MODERATION_FAILURE_BACKOFF_MAX = 600
 
 # The number of new ratings before the classifier model is retrained
 NEW_RATINGS_BEFORE_RETRAIN = 20

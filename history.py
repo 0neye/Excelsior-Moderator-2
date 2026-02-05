@@ -26,7 +26,7 @@ class MessageStore:
     
     def __init__(self):
         """Initialize the message store with a dictionary mapping channel IDs to deques."""
-        max_size = HISTORY_PER_CHECK + MESSAGES_PER_CHECK
+        max_size = max(HISTORY_PER_CHECK, MESSAGES_PER_CHECK)
         # Dictionary mapping channel_id to deque of messages for that channel
         self._channel_messages: dict[int, deque[discord.Message]] = {}
         # Dictionary mapping channel_id to metadata about that channel/thread

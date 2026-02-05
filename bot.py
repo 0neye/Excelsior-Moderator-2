@@ -2,7 +2,7 @@
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Callable
 
 import discord
@@ -19,6 +19,8 @@ from config import (
     REACTION_EMOJI,
     LOG_CHANNEL_ID,
     SECS_BETWEEN_AUTO_CHECKS,
+    MODERATION_FAILURE_BACKOFF_BASE,
+    MODERATION_FAILURE_BACKOFF_MAX,
     DEFAULT_LLM_PROVIDER,
     DEFAULT_LLM_MODEL,
     get_logger,
@@ -54,6 +56,8 @@ class ChannelModerationState:
     most_recent_message_id: int | None = None
     trigger_event: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task | None = None
+    consecutive_failures: int = 0
+    cooldown_until: datetime | None = None
 
 
 @dataclass
@@ -97,6 +101,18 @@ class ExcelsiorBot(discord.Bot):
             self.channel_states[channel_id] = ChannelModerationState(channel_id=channel_id)
         return self.channel_states[channel_id]
 
+    def _cooldown_remaining(self, state: ChannelModerationState) -> float | None:
+        """
+        Return remaining cooldown seconds after a failed moderation run.
+        """
+        if state.cooldown_until is None:
+            return None
+        remaining = (state.cooldown_until - datetime.now(timezone.utc)).total_seconds()
+        if remaining <= 0:
+            state.cooldown_until = None
+            return None
+        return remaining
+
     def _compute_idle_timeout(self, state: ChannelModerationState) -> float | None:
         """
         Calculate seconds remaining before the idle timer should trigger moderation.
@@ -107,11 +123,47 @@ class ExcelsiorBot(discord.Bot):
         Returns:
             Seconds remaining or None when no idle timer is running.
         """
-        if not (state.has_new_message_since_check and state.idle_timer_started_at):
-            return None
-        elapsed = (datetime.now(timezone.utc) - state.idle_timer_started_at).total_seconds()
-        remaining = SECS_BETWEEN_AUTO_CHECKS - elapsed
-        return remaining
+        idle_remaining: float | None = None
+        if state.has_new_message_since_check and state.idle_timer_started_at:
+            elapsed = (datetime.now(timezone.utc) - state.idle_timer_started_at).total_seconds()
+            idle_remaining = SECS_BETWEEN_AUTO_CHECKS - elapsed
+            if idle_remaining < 0:
+                idle_remaining = 0
+
+        cooldown_remaining = self._cooldown_remaining(state)
+        if cooldown_remaining is None:
+            return idle_remaining
+        if state.messages_since_check >= MESSAGES_PER_CHECK:
+            return cooldown_remaining
+        if idle_remaining is None:
+            return cooldown_remaining
+        if idle_remaining == 0:
+            return cooldown_remaining
+        return min(idle_remaining, cooldown_remaining)
+
+    def _register_moderation_failure(self, state: ChannelModerationState, reason: str) -> None:
+        """
+        Record a failed moderation run and apply a backoff cooldown.
+        """
+        state.consecutive_failures += 1
+        backoff = min(
+            MODERATION_FAILURE_BACKOFF_BASE * (2 ** (state.consecutive_failures - 1)),
+            MODERATION_FAILURE_BACKOFF_MAX,
+        )
+        state.cooldown_until = datetime.now(timezone.utc) + timedelta(seconds=backoff)
+        logger.warning(
+            "Moderation backoff for channel %s after failure (%s); cooldown %ss",
+            state.channel_id,
+            reason,
+            backoff,
+        )
+
+    def _reset_moderation_failures(self, state: ChannelModerationState) -> None:
+        """
+        Clear failure counters after a successful moderation run.
+        """
+        state.consecutive_failures = 0
+        state.cooldown_until = None
 
     def _should_moderate(self, state: ChannelModerationState) -> bool:
         """
@@ -123,6 +175,8 @@ class ExcelsiorBot(discord.Bot):
         Returns:
             True when thresholds are met, False otherwise.
         """
+        if self._cooldown_remaining(state) is not None:
+            return False
         if state.messages_since_check >= MESSAGES_PER_CHECK:
             return True
         remaining = self._compute_idle_timeout(state)
@@ -248,6 +302,7 @@ class ExcelsiorBot(discord.Bot):
 
         if result.success:
             # Reset counters after a successful moderation pass
+            self._reset_moderation_failures(state)
             state.messages_since_check = 0
             state.has_new_message_since_check = False
             state.idle_timer_started_at = None
@@ -262,6 +317,7 @@ class ExcelsiorBot(discord.Bot):
                 result.total_flagged,
             )
         else:
+            self._register_moderation_failure(state, result.reason)
             logger.warning(
                 "Moderation run returned False for channel %s (reason=%s, details=%s)",
                 channel.id,
@@ -320,6 +376,7 @@ class ExcelsiorBot(discord.Bot):
             try:
                 await self._run_moderation(channel, state, trigger_reason)
             except Exception:
+                self._register_moderation_failure(state, "exception")
                 # Log and continue loop so the scheduler keeps running
                 logger.exception(
                     "Moderation run failed for channel %s (reason=%s)",

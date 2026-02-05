@@ -15,6 +15,39 @@ from utils import format_message_history
 # Timeout for LLM API calls in seconds
 LLM_TIMEOUT_SECONDS = 120.0
 
+LLM_PROVIDER_LOCKS: dict[str, asyncio.Lock] = {}
+
+def _get_provider_lock(provider: str) -> asyncio.Lock:
+    """
+    Lazily create provider locks inside the running event loop.
+    """
+    lock = LLM_PROVIDER_LOCKS.get(provider)
+    if lock is None:
+        lock = asyncio.Lock()
+        LLM_PROVIDER_LOCKS[provider] = lock
+    return lock
+
+async def _run_llm_call(provider: str, call: Callable[[], Any]) -> Any:
+    """
+    Run a blocking LLM call in a thread with a timeout, avoiding overlap on timeout.
+    """
+    lock = _get_provider_lock(provider)
+    await lock.acquire()
+    task = asyncio.create_task(asyncio.to_thread(call))
+    release_now = True
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=LLM_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        release_now = False
+        def _release(_task: asyncio.Task) -> None:
+            if lock.locked():
+                lock.release()
+        task.add_done_callback(_release)
+        raise
+    finally:
+        if release_now and lock.locked():
+            lock.release()
+
 cerebras_client = Cerebras(api_key=CEREBRAS_API_KEY)
 
 # OpenRouter client using the OpenAI-compatible API
@@ -224,6 +257,11 @@ async def extract_features_from_formatted_history(
     - The message history is provided in chronological order, from oldest to newest.
     - The message history format is: [timestamp] (rel_id) [reply to rel_id or username] ❝message content❞ (edited) [reactions]
     - This is a gaming server discussing the game Cosmoteer: Starship Architect & Commander.
+
+    ### Urgency:
+    - Respond quickly (try to limit reasoning to ~2k tokens).
+    - Output only the JSON object required by the schema.
+
     {required_msg_instruction}{ignore_leading_messages_instruction}"""
 
     user_prompt = f"""
@@ -247,62 +285,70 @@ async def extract_features_from_formatted_history(
     try:
         if provider == "cerebras":
             # Run synchronous Cerebras API call in a thread pool with timeout
-            response: Any = await asyncio.wait_for(
-                asyncio.to_thread(
-                    lambda: cerebras_client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        response_format={
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": "candidate_features",
-                                "strict": True,
-                                "schema": CANDIDATE_FEATURES_SCHEMA
-                            }
-                        },
-                        stream=False,
-                        max_completion_tokens=65536,
+            def _cerebras_request() -> Any:
+                request_kwargs = {
+                    "model": model,
+                    "messages": messages,
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "candidate_features",
+                            "strict": True,
+                            "schema": CANDIDATE_FEATURES_SCHEMA
+                        }
+                    },
+                    "stream": False,
+                    "max_completion_tokens": 65536,
+                }
+                try:
+                    return cerebras_client.chat.completions.create(
+                        **request_kwargs,
+                        timeout=LLM_TIMEOUT_SECONDS,
                     )
-                ),
-                timeout=LLM_TIMEOUT_SECONDS,
-            )
+                except TypeError:
+                    return cerebras_client.chat.completions.create(**request_kwargs)
+
+            response: Any = await _run_llm_call("cerebras", _cerebras_request)
         elif provider == "openrouter":
             # Run synchronous OpenRouter API call in a thread pool with timeout
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    lambda: openrouter_client.chat.completions.create(
-                        model=model,
-                        messages=messages,  # type: ignore[arg-type]
-                        response_format={
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": "candidate_features",
-                                "strict": True,
-                                "schema": CANDIDATE_FEATURES_SCHEMA
-                            }
-                        },
-                        max_tokens=65536,
-                        extra_body={"reasoning": {"enabled": True}}
+            def _openrouter_request() -> Any:
+                request_kwargs = {
+                    "model": model,
+                    "messages": messages,  # type: ignore[arg-type]
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "candidate_features",
+                            "strict": True,
+                            "schema": CANDIDATE_FEATURES_SCHEMA
+                        }
+                    },
+                    "max_tokens": 65536,
+                    "extra_body": {"reasoning": {"enabled": True}},
+                }
+                try:
+                    return openrouter_client.chat.completions.create(
+                        **request_kwargs,
+                        timeout=LLM_TIMEOUT_SECONDS,
                     )
-                ),
-                timeout=LLM_TIMEOUT_SECONDS,
-            )
+                except TypeError:
+                    return openrouter_client.chat.completions.create(**request_kwargs)
+
+            response = await _run_llm_call("openrouter", _openrouter_request)
         elif provider == "gemini":
             # Run synchronous Gemini API call in a thread pool with timeout
-            gemini_response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    lambda: gemini_client.models.generate_content(
-                        model=model,
-                        contents=user_prompt,
-                        config=genai.types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            response_schema=CANDIDATE_FEATURES_SCHEMA_GEMINI,
-                            system_instruction=system_prompt
-                        )
+            def _gemini_request() -> Any:
+                return gemini_client.models.generate_content(
+                    model=model,
+                    contents=user_prompt,
+                    config=genai.types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=CANDIDATE_FEATURES_SCHEMA_GEMINI,
+                        system_instruction=system_prompt
                     )
-                ),
-                timeout=LLM_TIMEOUT_SECONDS,
-            )
+                )
+
+            gemini_response = await _run_llm_call("gemini", _gemini_request)
             
             # Parse the Gemini response directly
             gemini_content = gemini_response.text
