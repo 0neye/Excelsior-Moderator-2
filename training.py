@@ -13,6 +13,8 @@ import numpy as np
 
 from config import (
     CONTINUOUS_TRAINING_FEATURE_MODE,
+    CONTINUOUS_TRAINING_COLLAPSE_CATEGORIES,
+    CONTINUOUS_TRAINING_COLLAPSE_AMBIGUOUS,
     DEFAULT_LLM_MODEL,
     DEFAULT_LLM_PROVIDER,
     get_logger,
@@ -145,10 +147,35 @@ def load_rated_messages_from_db() -> list[dict]:
         session.close()
 
 
+def collapse_category_label(
+    category: str,
+    collapse_ambiguous_to_no_flag: bool = False
+) -> str:
+    """
+    Normalize category labels when collapsing classes.
+    
+    Args:
+        category: Original rating category
+        collapse_ambiguous_to_no_flag: Whether to map ambiguous to no-flag
+        
+    Returns:
+        Collapsed category label following the mapping rules
+    """
+    if category in {"NA", "no-flag"}:
+        return "no-flag"
+    if category in {"unsolicited", "unconstructive"}:
+        return "flag"
+    if collapse_ambiguous_to_no_flag and category == "ambiguous":
+        return "no-flag"
+    return category
+
+
 def prepare_training_data_simple(
     rated_messages: list[dict],
     features_by_message: dict[int, list[dict[str, float]]],
     feature_names: list[str] | None = None,
+    collapse_categories: bool = False,
+    collapse_ambiguous_to_no_flag: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """
     Prepare feature matrix and labels from rated messages and their features.
@@ -157,6 +184,8 @@ def prepare_training_data_simple(
         rated_messages: List of rated message dicts with message_id and category
         features_by_message: Dict mapping message_id to feature lists
         feature_names: Ordered list of feature names to use (defaults to FEATURE_NAMES)
+        collapse_categories: If True, collapse 5-category ratings to binary flag/no-flag
+        collapse_ambiguous_to_no_flag: If collapsing, whether to map ambiguous to no-flag
 
     Returns:
         Tuple of (feature matrix X, labels y, feature_names used)
@@ -177,15 +206,24 @@ def prepare_training_data_simple(
             # Extract features in consistent order
             feature_vector = [feature_dict.get(name, 0.0) for name in feature_names]
             X.append(feature_vector)
-            y.append(msg["category"])
+            
+            # Apply category collapsing if enabled
+            label = msg["category"]
+            if collapse_categories:
+                label = collapse_category_label(label, collapse_ambiguous_to_no_flag)
+            y.append(label)
 
     X = np.array(X)
     y = np.array(y)
 
+    label_distribution = dict(zip(*np.unique(y, return_counts=True)))
+    distribution_label = "collapsed label distribution" if collapse_categories else "label distribution"
     logger.info(
-        "Prepared training data: %d samples, %d features",
+        "Prepared training data: %d samples, %d features, %s: %s",
         X.shape[0] if len(X) > 0 else 0,
         len(feature_names),
+        distribution_label,
+        label_distribution,
     )
 
     return X, y, feature_names
@@ -195,6 +233,8 @@ async def retrain_model(
     feature_mode: Literal["existing_only", "extract_on_demand"] | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
+    collapse_categories: bool | None = None,
+    collapse_ambiguous_to_no_flag: bool | None = None,
 ) -> bool:
     """
     Retrain the moderation classifier using current ratings and features.
@@ -203,6 +243,8 @@ async def retrain_model(
         feature_mode: How to handle feature extraction. Uses config default if None.
         llm_provider: LLM provider for on-demand extraction. Uses config default if None.
         llm_model: LLM model for on-demand extraction. Uses config default if None.
+        collapse_categories: Whether to collapse categories to binary. Uses config default if None.
+        collapse_ambiguous_to_no_flag: Whether to collapse ambiguous to no-flag. Uses config default if None.
 
     Returns:
         True if retraining succeeded, False otherwise
@@ -214,8 +256,17 @@ async def retrain_model(
         llm_provider = DEFAULT_LLM_PROVIDER
     if llm_model is None:
         llm_model = DEFAULT_LLM_MODEL
+    if collapse_categories is None:
+        collapse_categories = CONTINUOUS_TRAINING_COLLAPSE_CATEGORIES
+    if collapse_ambiguous_to_no_flag is None:
+        collapse_ambiguous_to_no_flag = CONTINUOUS_TRAINING_COLLAPSE_AMBIGUOUS
 
-    logger.info("Starting model retraining (mode=%s)...", feature_mode)
+    logger.info(
+        "Starting model retraining (mode=%s, collapse_categories=%s, collapse_ambiguous=%s)...",
+        feature_mode,
+        collapse_categories,
+        collapse_ambiguous_to_no_flag,
+    )
 
     try:
         # Load rated messages from DB
@@ -239,7 +290,10 @@ async def retrain_model(
 
         # Prepare training data
         X, y, feature_names = prepare_training_data_simple(
-            rated_messages, features_by_message
+            rated_messages,
+            features_by_message,
+            collapse_categories=collapse_categories,
+            collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag,
         )
 
         if len(X) == 0:

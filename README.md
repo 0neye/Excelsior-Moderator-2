@@ -14,7 +14,7 @@ When the bot flags a message, it:
 - Posts to a private log channel where moderators can rate the decision
 - Stores the flagged message with context in the database
 
-Moderators rate flagged messages into categories (no-flag, ambiguous, unconstructive, unsolicited, N/A), and the bot uses these ratings to retrain its model every 20 new ratings, creating a continuous improvement loop.
+Moderators rate flagged messages into categories (no-flag, ambiguous, unconstructive, unsolicited, N/A), and the bot uses these ratings to retrain its model every 20 new ratings, creating a continuous improvement loop. By default, the model trains on a simplified binary classification (flag vs no-flag) for better performance with limited training data.
 
 ## Architecture
 
@@ -47,6 +47,7 @@ The main Discord bot implementation using py-cord. Contains:
 - **`training.py`**: Continuous training module
   - Loads rated messages and features from database
   - Supports two modes: `existing_only` (fast) and `extract_on_demand` (complete)
+  - Supports binary (flag/no-flag) or multi-class (5 categories) classification
   - Retrains model when sufficient new ratings are collected
   - Automatically triggered by rating system
 
@@ -253,6 +254,7 @@ familiarity = co_occurrence_count / (co_occurrence_count + 10)
 3. Prepare training data:
    - Build feature matrix X with 18 features
    - Build label vector y with rating categories
+   - Apply category collapsing if enabled (see below)
 4. Train LightGBM classifier with balanced class weights
 5. Save model to `models/lightgbm_model.joblib`
 6. Model is immediately used by bot (loaded on next moderation run)
@@ -261,10 +263,17 @@ familiarity = co_occurrence_count / (co_occurrence_count + 10)
 1. Runtime features (no `extraction_run_id`)
 2. Most recent extraction run features
 
+**Category Collapsing** (configured via `CONTINUOUS_TRAINING_COLLAPSE_CATEGORIES`):
+- **Binary mode (default)**: Collapses 5 categories into 2 classes for simpler classification
+  - `"flag"`: Combines "unsolicited" + "unconstructive" 
+  - `"no-flag"`: Combines "NA" + "no-flag" + "ambiguous" (if `CONTINUOUS_TRAINING_COLLAPSE_AMBIGUOUS = True`)
+- **Multi-class mode**: Uses all 5 original categories (no-flag, ambiguous, unconstructive, unsolicited, NA)
+- Binary mode is recommended for most deployments as it's more robust with limited training data
+
 **Model Configuration**:
 - 200 estimators, max depth 6, learning rate 0.1
 - Balanced class weights to handle imbalanced categories
-- Multi-class objective for 5-category classification
+- Binary or multi-class objective depending on category collapse setting
 
 ### 7. Bootstrapping
 
@@ -277,8 +286,13 @@ familiarity = co_occurrence_count / (co_occurrence_count + 10)
 2. **Fetch Context**: Download Discord context messages around each rated message
 3. **Bootstrap Stats**: Backfill user statistics from Discord history
 4. **Extract Features**: Run LLM feature extraction with configurable runs per message
-5. **Train Model**: Train LightGBM classifier on extracted features
+5. **Train Model**: Train LightGBM classifier on extracted features (binary or multi-class)
 6. **Evaluate**: Cross-validation and confusion matrix analysis
+
+**Category Collapsing Options**:
+- The bootstrapping pipeline prompts for category collapsing during training steps
+- Same mapping as continuous training: "unsolicited"/"unconstructive" → "flag", "NA"/"no-flag"/"ambiguous" → "no-flag"
+- Useful for comparing binary vs multi-class model performance during development
 
 **Interactive REPL**:
 ```
@@ -331,8 +345,12 @@ OPENROUTER_API_KEY       # API key for OpenRouter
 GEMINI_API_KEY           # API key for Google Gemini
 
 # Training
-NEW_RATINGS_BEFORE_RETRAIN           # Ratings before auto-retrain (default: 20)
-CONTINUOUS_TRAINING_FEATURE_MODE     # "existing_only" or "extract_on_demand"
+NEW_RATINGS_BEFORE_RETRAIN                  # Ratings before auto-retrain (default: 20)
+CONTINUOUS_TRAINING_FEATURE_MODE            # "existing_only" or "extract_on_demand"
+CONTINUOUS_TRAINING_COLLAPSE_CATEGORIES     # Collapse 5-category to binary flag/no-flag (default: True)
+CONTINUOUS_TRAINING_COLLAPSE_AMBIGUOUS      # Map ambiguous to no-flag when collapsing (default: True)
+                                            # Note: Binary mode recommended for <2000 ratings
+                                            # Multi-class requires substantial balanced training data
 
 # Database
 DB_FILE                  # SQLite database filename (default: "excelsior.db")

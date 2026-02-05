@@ -55,6 +55,15 @@ NEW_RATINGS_BEFORE_RETRAIN = 20
 # - "extract_on_demand": Extract features for new messages via LLM when training (more complete)
 CONTINUOUS_TRAINING_FEATURE_MODE = "existing_only"
 
+# Category collapsing for continuous training:
+# - If True, collapses 5-category ratings to binary "flag"/"no-flag" for training
+# - Mapping: "unsolicited" and "unconstructive" -> "flag"; "NA" and "no-flag" -> "no-flag"
+# - "ambiguous" handling controlled by CONTINUOUS_TRAINING_COLLAPSE_AMBIGUOUS
+CONTINUOUS_TRAINING_COLLAPSE_CATEGORIES = True
+
+# If collapsing is enabled, whether to map "ambiguous" to "no-flag" instead of keeping it separate
+CONTINUOUS_TRAINING_COLLAPSE_AMBIGUOUS = True
+
 # The role for people who don't care about harsh feedback
 WAIVER_ROLE_NAME = "Criticism Pass"
 
