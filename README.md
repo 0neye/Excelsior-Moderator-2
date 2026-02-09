@@ -4,7 +4,7 @@ A Discord bot that helps maintain constructive feedback culture by automatically
 
 ## What Does It Do?
 
-The bot monitors your Discord channels and watches for feedback that might be:
+The bot monitors Discord channels and watches for feedback that might be:
 - **Unconstructive**: Harsh or negative without helpful suggestions
 - **Unsolicited**: Given when nobody asked for it
 
@@ -13,7 +13,9 @@ When the bot thinks a message might violate guidelines, it:
 - Posts it to a review channel where moderators can confirm or correct the decision
 - Learns from these ratings to get better over time
 
-The more ratings the bot receives, the smarter it becomes at understanding your community's specific norms.
+The more ratings the bot receives, the smarter it becomes at understanding the community's specific norms.
+
+<img width="1086" height="362" alt="image" src="https://github.com/user-attachments/assets/128cea1d-bc2a-4322-bfa4-a7e687ce2a62" />
 
 ## How to Use the Bot
 
@@ -41,7 +43,7 @@ The more ratings the bot receives, the smarter it becomes at understanding your 
 
 **NOTE:** Requires existing rating data in specific format. From-zero bootstrap currently not supported.
 
-For detailed technical setup instructions, see [TECHNICAL.md](TECHNICAL.md).
+For detailed technical information, see [TECHNICAL.md](TECHNICAL.md).
 
 ## Rating System
 
