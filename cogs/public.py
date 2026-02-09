@@ -24,7 +24,7 @@ class Public(commands.Cog):
         """Displays basic information about the bot."""
         embed = discord.Embed(
             title="Ellie",
-            description="A moderation bot for the Excelsior server! Currently in development.",
+            description="A bot for the Excelsior server! See the code and more info [here](https://github.com/0neye/Excelsior-Moderator-2).\nKeeping things wholesome.",
             color=discord.Color.blue()
         )        
         await ctx.respond(embed=embed)
