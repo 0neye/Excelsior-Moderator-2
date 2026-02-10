@@ -69,6 +69,16 @@ Help the bot learn by rating flagged messages! Your input directly improves accu
 
 Moderators can also rate quickly by reacting to flagged messages in the private log channel.
 
+## FAQ
+
+### Are our messages being sent to AI companies for training?
+
+No. The bot uses the Cerebras API, which has a strict no-logs policy, so message content is not stored by Cerebras for model training.
+
+### How does the bot keep improving over time?
+
+Continuous training is done locally using community ratings collected by this bot, so improvement data stays within this project environment.
+
 ## Credits
 
 Developed for the Excelsior community to maintain constructive and welcoming feedback culture.
