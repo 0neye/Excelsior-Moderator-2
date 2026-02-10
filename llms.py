@@ -48,16 +48,42 @@ async def _run_llm_call(provider: str, call: Callable[[], Any]) -> Any:
         if release_now and lock.locked():
             lock.release()
 
-cerebras_client = Cerebras(api_key=CEREBRAS_API_KEY)
+cerebras_client: Cerebras | None = None
+openrouter_client: OpenAI | None = None
+gemini_client: genai.Client | None = None
 
-# OpenRouter client using the OpenAI-compatible API
-openrouter_client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY
-)
 
-# Gemini client using the newer google-genai SDK
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+def _get_cerebras_client() -> Cerebras:
+    """Lazily initialize the Cerebras client only when that provider is used."""
+    global cerebras_client
+    if cerebras_client is None:
+        if not CEREBRAS_API_KEY:
+            raise ValueError("CEREBRAS_API_KEY is required when provider='cerebras'")
+        cerebras_client = Cerebras(api_key=CEREBRAS_API_KEY)
+    return cerebras_client
+
+
+def _get_openrouter_client() -> OpenAI:
+    """Lazily initialize the OpenRouter client only when that provider is used."""
+    global openrouter_client
+    if openrouter_client is None:
+        if not OPENROUTER_API_KEY:
+            raise ValueError("OPENROUTER_API_KEY is required when provider='openrouter'")
+        openrouter_client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPENROUTER_API_KEY,
+        )
+    return openrouter_client
+
+
+def _get_gemini_client() -> genai.Client:
+    """Lazily initialize the Gemini client only when that provider is used."""
+    global gemini_client
+    if gemini_client is None:
+        if not GEMINI_API_KEY:
+            raise ValueError("GEMINI_API_KEY is required when provider='gemini'")
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    return gemini_client
 
 # JSON schema for structured output of candidate features
 def _strip_additional_properties(schema: Any) -> Any:
@@ -301,12 +327,12 @@ async def extract_features_from_formatted_history(
                     "max_completion_tokens": 65536,
                 }
                 try:
-                    return cerebras_client.chat.completions.create(
+                    return _get_cerebras_client().chat.completions.create(
                         **request_kwargs,
                         timeout=LLM_TIMEOUT_SECONDS,
                     )
                 except TypeError:
-                    return cerebras_client.chat.completions.create(**request_kwargs)
+                    return _get_cerebras_client().chat.completions.create(**request_kwargs)
 
             response: Any = await _run_llm_call("cerebras", _cerebras_request)
         elif provider == "openrouter":
@@ -327,18 +353,18 @@ async def extract_features_from_formatted_history(
                     "extra_body": {"reasoning": {"enabled": True}},
                 }
                 try:
-                    return openrouter_client.chat.completions.create(
+                    return _get_openrouter_client().chat.completions.create(
                         **request_kwargs,
                         timeout=LLM_TIMEOUT_SECONDS,
                     )
                 except TypeError:
-                    return openrouter_client.chat.completions.create(**request_kwargs)
+                    return _get_openrouter_client().chat.completions.create(**request_kwargs)
 
             response = await _run_llm_call("openrouter", _openrouter_request)
         elif provider == "gemini":
             # Run synchronous Gemini API call in a thread pool with timeout
             def _gemini_request() -> Any:
-                return gemini_client.models.generate_content(
+                return _get_gemini_client().models.generate_content(
                     model=model,
                     contents=user_prompt,
                     config=genai.types.GenerateContentConfig(

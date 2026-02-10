@@ -436,13 +436,15 @@ class ExcelsiorBot(discord.Bot):
                 self._ensure_scheduler_task(channel)
     
 
-    async def flag_message(self, message: discord.Message, db_session=None) -> None:
+    async def flag_message(self, message: discord.Message) -> int | None:
         """
-        Flags a message by adding a reaction and posting to the log channel for mod rating.
+        Flag a message in Discord and return the created log-channel message ID.
 
         Args:
             message: The Discord message to flag.
-            db_session: Optional DB session. If not provided, creates one internally.
+        
+        Returns:
+            The log-channel message ID when a post is created, otherwise None.
         """
         # Add reaction to the original message
         await message.add_reaction(REACTION_EMOJI)
@@ -455,7 +457,7 @@ class ExcelsiorBot(discord.Bot):
                 LOG_CHANNEL_ID,
                 message.id,
             )
-            return
+            return None
 
         # Build the log message content
         author_name = message.author.display_name or message.author.name
@@ -479,7 +481,7 @@ class ExcelsiorBot(discord.Bot):
                 LOG_CHANNEL_ID,
                 message.id,
             )
-            return
+            return None
         log_message = await log_channel.send(log_content)
         logger.info(
             "Posted flagged message %s to log channel %s as message %s",
@@ -493,22 +495,7 @@ class ExcelsiorBot(discord.Bot):
         for emoji in rating_emojis:
             await log_message.add_reaction(emoji)
 
-        # Store the mapping in DB
-        close_session = False
-        if db_session is None:
-            db_session = self.get_db_session()
-            close_session = True
-
-        try:
-            post = LogChannelRatingPost(
-                bot_message_id=log_message.id,
-                flagged_message_id=message.id,
-            )
-            db_session.add(post)
-            db_session.commit()
-        finally:
-            if close_session:
-                db_session.close()
+        return log_message.id
 
 
     async def moderate_channel(self, channel: discord.TextChannel | discord.Thread) -> ModerationResult:
@@ -560,36 +547,6 @@ class ExcelsiorBot(discord.Bot):
             result.reason = "No candidates with Discord message IDs were found."
             return result
 
-        # Filter out anything directed at a user with the WAIVER_ROLE_NAME role
-        candidate_messages = [next((msg for msg in store_history_copy if msg.id == candidate["discord_message_id"]), None) for candidate in candidates]
-
-        candidate_message_authors = [message.author for message in candidate_messages if message is not None]
-
-        # Build a filtered list to avoid mutating while iterating
-        filtered_candidates: list[dict] = []
-        filtered_candidate_messages: list[discord.Message | None] = []
-        for candidate, message_author in zip(candidates, candidate_message_authors):
-            if isinstance(message_author, discord.Member) and message_author.roles:
-                if any(role.name == WAIVER_ROLE_NAME for role in message_author.roles):
-                    continue
-            filtered_candidates.append(candidate)
-            filtered_candidate_messages.append(
-                next((msg for msg in store_history_copy if msg.id == candidate["discord_message_id"]), None)
-            )
-
-        candidates = filtered_candidates
-        candidate_messages = filtered_candidate_messages
-
-        if not candidates:
-            logger.info(
-                "No candidates remain after waiver-role filter for channel %s",
-                channel.id,
-            )
-            result.candidates_after_filters = 0
-            result.success = True
-            result.reason = "No candidates remain after waiver-role filter."
-            return result
-
         # Filter out candidates that are too close to the beginning of the channel history
         # since the model is unlikely to have enough context to extract good features
         # This is redundant, but can't hurt
@@ -600,25 +557,48 @@ class ExcelsiorBot(discord.Bot):
             except (TypeError, ValueError):
                 return 0
 
-        candidates = [
-            candidate for candidate in candidates
-            if _safe_message_index(candidate) > MESSAGES_PER_CHECK # message_id is 1-based index
-        ]
+        # Build a lookup of users who currently hold the waiver role; candidates
+        # targeting these users are excluded from moderation.
+        waiver_target_user_ids: set[int] = set()
+        waiver_role = next(
+            (role for role in channel.guild.roles if role.name == WAIVER_ROLE_NAME),
+            None,
+        )
+        if waiver_role is not None:
+            waiver_target_user_ids = {member.id for member in waiver_role.members}
 
-        if not candidates:
+        # Keep candidate/message pairs aligned through all downstream filtering.
+        filtered_pairs: list[tuple[dict, discord.Message]] = []
+        for candidate in candidates:
+            candidate_message = next(
+                (msg for msg in store_history_copy if msg.id == candidate["discord_message_id"]),
+                None,
+            )
+            if candidate_message is None:
+                continue
+
+            target_user_id = candidate.get("target_user_id")
+            if isinstance(target_user_id, int) and target_user_id in waiver_target_user_ids:
+                continue
+
+            if _safe_message_index(candidate) <= MESSAGES_PER_CHECK:  # message_id is 1-based index
+                continue
+
+            filtered_pairs.append((candidate, candidate_message))
+
+        if not filtered_pairs:
             logger.info(
-                "No candidates remain after early-history filter for channel %s",
+                "No candidates remain after moderation filters for channel %s",
                 channel.id,
             )
             result.candidates_after_filters = 0
             result.success = True
-            result.reason = "No candidates remain after early-history filter."
+            result.reason = "No candidates remain after moderation filters."
             return result
-        
+
+        candidates = [candidate for candidate, _ in filtered_pairs]
+        candidate_messages = [candidate_message for _, candidate_message in filtered_pairs]
         result.candidates_after_filters = len(candidates)
-            
-        # Get the actual message objects for the candidates
-        candidate_messages = [next((msg for msg in store_history_copy if msg.id == candidate["discord_message_id"]), None) for candidate in candidates]
 
         logger.info(
             "Processing %d filtered candidate(s) for channel %s",
@@ -709,6 +689,7 @@ class ExcelsiorBot(discord.Bot):
             
             # Collect all flagged messages first, then commit once at the end
             flagged_messages_to_add: list[FlaggedMessage] = []
+            log_posts_to_add: list[LogChannelRatingPost] = []
             # Capture runtime feature rows so we retain the model inputs alongside flags
             feature_records_to_add: list[MessageFeatures] = []
             
@@ -722,7 +703,6 @@ class ExcelsiorBot(discord.Bot):
                             channel.id,
                             getattr(candidate_message.author, "id", "unknown"),
                         )
-                        await self.flag_message(candidate_message, db_session)
                         surrounding_context = [msg for msg in store_history_copy if msg.id != candidate_message.id]
                         # Serialize surrounding context for persistent storage
                         context_ids, serialized_context = serialize_context_messages(surrounding_context)
@@ -747,12 +727,20 @@ class ExcelsiorBot(discord.Bot):
                             target_username=candidate.get("target_username"),
                         )
                         flagged_messages_to_add.append(flagged_message)
+                        log_message_id = await self.flag_message(candidate_message)
+                        if log_message_id is not None:
+                            log_posts_to_add.append(
+                                LogChannelRatingPost(
+                                    bot_message_id=log_message_id,
+                                    flagged_message_id=candidate_message.id,
+                                )
+                            )
                     
                     # Persist runtime feature vector for this flagged message when not already saved
                     if candidate_message.id not in runtime_feature_ids:
                         feature_payload = candidate.get("features") or {}
                         if feature_payload:
-                            target_username = feature_payload.get("target_username")
+                            target_username = candidate.get("target_username")
                             feature_record = MessageFeatures(
                                 extraction_run_id=None,  # Null signals runtime (non-batch) extraction
                                 message_id=candidate_message.id,
@@ -763,15 +751,18 @@ class ExcelsiorBot(discord.Bot):
                             feature_records_to_add.append(feature_record)
             
             # Add all flagged messages and runtime feature rows then commit once
-            if flagged_messages_to_add or feature_records_to_add:
+            if flagged_messages_to_add or log_posts_to_add or feature_records_to_add:
                 logger.info(
-                    "Persisting %d flagged message(s) and %d runtime feature row(s) for channel %s",
+                    "Persisting %d flagged message(s), %d log post mapping(s), and %d runtime feature row(s) for channel %s",
                     len(flagged_messages_to_add),
+                    len(log_posts_to_add),
                     len(feature_records_to_add),
                     channel.id,
                 )
                 for flagged_message in flagged_messages_to_add:
                     db_session.add(flagged_message)
+                for log_post in log_posts_to_add:
+                    db_session.add(log_post)
                 for feature_record in feature_records_to_add:
                     db_session.add(feature_record)
                 db_session.commit()

@@ -87,7 +87,10 @@ Continuous training system that automatically retrains on new ratings.
 
 **Modes**:
 - **`existing_only`** (default): Load features from database (no LLM cost)
-- **`extract_on_demand`**: Extract missing features via LLM (complete but expensive)
+- **`extract_on_demand`**: Extract only missing features via LLM (more complete, higher cost)
+  - Loads rated message records from the database
+  - Reuses stored context when available
+  - Fetches context from Discord API by `channel_id` + `message_id` when context is missing
 
 **Category Collapsing** (configurable):
 - **Binary mode** (default): flag/no-flag (recommended for <2000 ratings)
@@ -262,7 +265,7 @@ New model used on next moderation run
 2. **Filter candidates**:
    - Remove messages with `discusses_ellie > 0.2` (bot-related noise)
    - Remove messages without Discord IDs
-   - Remove messages from users with the "Criticism Pass" role
+   - Remove messages that target users with the "Criticism Pass" role
    - Remove messages too close to channel start (insufficient context)
 3. **Extract features**: LLM provides 15 semantic features per candidate
 4. **Augment with stats**: Add 3 database-derived features (seniority, familiarity)
@@ -283,7 +286,7 @@ New model used on next moderation run
 1. Load all rated messages from `FlaggedMessageRating` table
 2. Load features based on mode:
    - **`existing_only`**: Load from `MessageFeatures` table (no LLM cost)
-   - **`extract_on_demand`**: Extract missing features via LLM
+   - **`extract_on_demand`**: Extract missing features via LLM using DB-backed rated messages; missing context is fetched from Discord when possible
 3. Prepare training data:
    - Build feature matrix X with 18 features
    - Build label vector y with rating categories
@@ -485,10 +488,9 @@ User interaction frequency for familiarity scores.
 
 **Columns**:
 - `id` (Integer, PK): Auto-increment primary key
-- `user_a_id` (String): First user ID (smaller lexicographically)
-- `user_b_id` (String): Second user ID (larger lexicographically)
+- `user_a_id` (BigInteger): First user ID (smaller numeric ID)
+- `user_b_id` (BigInteger): Second user ID (larger numeric ID)
 - `co_occurrence_count` (Integer): Number of co-occurrences in sliding windows
-- `updated_at` (DateTime): Last update timestamp
 
 **Indexes**: `(user_a_id, user_b_id)` (unique)
 
@@ -515,9 +517,9 @@ Maps log channel messages to flagged messages (enables reaction-based rating).
 
 **Columns**:
 - `id` (Integer, PK): Auto-increment primary key
-- `log_message_id` (String, Unique): Discord message ID in log channel
-- `flagged_message_id` (Integer, FK): References `flagged_messages.id`
-- `created_at` (DateTime): Post timestamp
+- `bot_message_id` (BigInteger, Unique): Discord message ID in log channel
+- `flagged_message_id` (BigInteger, FK): References `flagged_messages.message_id`
+- `posted_at` (DateTime): Post timestamp
 
 #### `dictionary_entries`
 
@@ -574,6 +576,8 @@ OPENROUTER_API_KEY        # API key for OpenRouter (from .env)
 GEMINI_API_KEY            # API key for Google Gemini (from .env)
 ```
 
+Only the API key for the active `DEFAULT_LLM_PROVIDER` is required at runtime.
+
 **Provider Recommendations**:
 - **Cerebras**: Best cost/performance for production (~$0.10/M tokens)
 - **OpenRouter**: Good for testing different models (GPT-4, Claude, etc.)
@@ -590,7 +594,9 @@ CONTINUOUS_TRAINING_COLLAPSE_AMBIGUOUS       # Map ambiguous to no-flag (default
 
 **Training Modes**:
 - **`existing_only`**: Fast, uses pre-extracted features from database (recommended)
-- **`extract_on_demand`**: Re-extracts all features via LLM (expensive, complete)
+- **`extract_on_demand`**: Extracts only missing features via LLM (expensive when many are missing)
+  - Uses `flagged_messages` rows as source of truth
+  - Falls back to Discord API context fetch when a row has empty/missing context
 
 **Category Collapsing**:
 - **Binary mode** (recommended): Simpler classification, works with <2000 ratings
@@ -850,7 +856,7 @@ Re-run bootstrapping or continuous training with the new feature:
 
 ```bash
 python bootstrapping.py
-# Select option 5 (Train Model) or option 7 (Run Full Pipeline)
+# Select option 5 (Train Model) or option 1 (Run Full Pipeline)
 ```
 
 **Important**: You must re-extract features if adding a new LLM feature. Existing features in the database won't include the new field.
@@ -1224,6 +1230,7 @@ GROUP BY category;
 1. **Collect more ratings**: Need at least 20 ratings (10 per class for binary)
 2. **Use `extract_on_demand` mode**: Re-extract missing features
    - Set `CONTINUOUS_TRAINING_FEATURE_MODE = "extract_on_demand"` in `config.py`
+   - Requires valid Discord access for rows without stored context
 3. **Check console logs**: Look for extraction or training errors
 4. **Manually trigger retraining**: Use `/retrain` command to see errors
 

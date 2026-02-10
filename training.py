@@ -300,7 +300,7 @@ async def retrain_model(
             logger.warning("No training samples after preparation, skipping retraining")
             return False
 
-        # Need at least 2 samples per class for stratified split
+        # Need at least 2 classes to train any classifier meaningfully.
         unique_classes, counts = np.unique(y, return_counts=True)
         if len(unique_classes) < 2:
             logger.warning(
@@ -318,13 +318,36 @@ async def retrain_model(
             # Use all data for training without test split
             X_train, y_train = X, y
         else:
-            # Use sklearn for train/test split
-            from sklearn.model_selection import train_test_split
-
-            # No test split because at this point we've already tested the model with the bootstrapping module
-            X_train, _, y_train, _ = train_test_split(
-                X, y, test_size=0.01, random_state=42, stratify=y
+            # Keep a tiny holdout only when it is mathematically valid for stratification.
+            n_samples = len(y)
+            n_classes = len(unique_classes)
+            desired_test_count = max(int(round(n_samples * 0.01)), 1)
+            train_count_after_split = n_samples - desired_test_count
+            can_stratify_split = (
+                desired_test_count >= n_classes
+                and train_count_after_split >= n_classes
             )
+
+            if can_stratify_split:
+                from sklearn.model_selection import train_test_split
+
+                try:
+                    X_train, _, y_train, _ = train_test_split(
+                        X, y, test_size=desired_test_count, random_state=42, stratify=y
+                    )
+                except ValueError as exc:
+                    logger.warning(
+                        "Skipping tiny stratified split due to sklearn constraint (%s); using all data for training",
+                        exc,
+                    )
+                    X_train, y_train = X, y
+            else:
+                logger.info(
+                    "Dataset too small for a 1%% stratified holdout (samples=%d, classes=%d); using all data for training",
+                    n_samples,
+                    n_classes,
+                )
+                X_train, y_train = X, y
 
         logger.info("Training with %d samples...", len(y_train))
 
@@ -379,26 +402,82 @@ async def _extract_features_on_demand(
         return features_by_message
 
     logger.info(
-        "%d messages need feature extraction, importing bootstrapping module...",
+        "%d messages need feature extraction; loading context from database...",
         len(messages_needing_features),
     )
 
-    # Import bootstrapping functions only when needed to avoid circular imports
+    # Import bootstrapping functions only when needed to avoid circular imports.
     from bootstrapping import (
+        RatedMessage,
         extract_features,
         fetch_discord_context,
-        load_rating_data,
     )
 
-    # Load full rated message data needed for feature extraction
-    full_rated_messages = load_rating_data()
-
-    # Filter to just the ones needing features
     ids_needing = {msg["message_id"] for msg in messages_needing_features}
-    messages_to_extract = [msg for msg in full_rated_messages if msg.message_id in ids_needing]
+    category_by_message = {
+        msg["message_id"]: msg["category"]
+        for msg in messages_needing_features
+    }
+
+    # Build RatedMessage objects directly from existing DB rows so extract_on_demand
+    # does not depend on bootstrapping JSON files.
+    session = get_session()
+    try:
+        flagged_rows = (
+            session.query(FlaggedMessage)
+            .filter(FlaggedMessage.message_id.in_(ids_needing))
+            .all()
+        )
+    finally:
+        session.close()
+
+    messages_to_extract: list[RatedMessage] = []
+    for row in flagged_rows:
+        context_messages = row.context_messages or []
+        channel_name = None
+        thread_name = None
+        for ctx in context_messages:
+            if not isinstance(ctx, dict):
+                continue
+            resolved_channel = ctx.get("channel_name") or ctx.get("parent_channel_name")
+            resolved_thread = ctx.get("thread_name")
+            if channel_name is None and isinstance(resolved_channel, str) and resolved_channel:
+                channel_name = resolved_channel
+            if thread_name is None and isinstance(resolved_thread, str) and resolved_thread:
+                thread_name = resolved_thread
+            if channel_name is not None and thread_name is not None:
+                break
+
+        timestamp_str = row.timestamp.isoformat() if row.timestamp else ""
+        flagged_at_str = row.flagged_at.isoformat() if row.flagged_at else timestamp_str
+        author_name = row.author_username or row.author_display_name or ""
+
+        messages_to_extract.append(
+            RatedMessage(
+                message_id=row.message_id,
+                channel_id=row.channel_id,
+                guild_id=row.guild_id,
+                author_id=row.author_id,
+                author_name=author_name,
+                content=row.content,
+                timestamp=timestamp_str,
+                flagged_at=flagged_at_str,
+                jump_url=f"https://discord.com/channels/{row.guild_id}/{row.channel_id}/{row.message_id}",
+                category=category_by_message.get(row.message_id, "NA"),
+                rater_user_id=0,
+                rating_id=f"auto_extract_{row.message_id}",
+                channel_name=channel_name,
+                thread_name=thread_name,
+                context_message_ids=row.context_message_ids or [],
+                context_messages=context_messages,
+            )
+        )
 
     if not messages_to_extract:
-        logger.warning("Could not load full message data for feature extraction")
+        logger.warning(
+            "Could not load flagged message rows for %d message(s) needing extraction",
+            len(ids_needing),
+        )
         return features_by_message
 
     # Fetch Discord context (uses cached data when available)

@@ -137,10 +137,21 @@ def extract_channel_thread_from_context(
     """
     if not context_messages:
         return None, None
-    
-    first_context = context_messages[0]
-    channel_name = first_context.get("channel_name") or first_context.get("parent_channel_name")
-    thread_name = first_context.get("thread_name")
+
+    channel_name: str | None = None
+    thread_name: str | None = None
+    for ctx in context_messages:
+        if not isinstance(ctx, dict):
+            continue
+        resolved_channel = ctx.get("channel_name") or ctx.get("parent_channel_name")
+        resolved_thread = ctx.get("thread_name")
+        if channel_name is None and isinstance(resolved_channel, str) and resolved_channel:
+            channel_name = resolved_channel
+        if thread_name is None and isinstance(resolved_thread, str) and resolved_thread:
+            thread_name = resolved_thread
+        if channel_name is not None and thread_name is not None:
+            break
+
     return channel_name, thread_name
 
 

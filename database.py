@@ -59,7 +59,7 @@ class FlaggedMessage(Base):
     
     # Timestamps
     timestamp = Column(DateTime, nullable=False)  # Original message timestamp
-    flagged_at = Column(DateTime, nullable=False, default=datetime.now(timezone.utc))
+    flagged_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     
     # Target user attribution (who the message was directed at, if applicable)
     target_user_id = Column(BigInteger, nullable=True)
@@ -93,7 +93,7 @@ class FlaggedMessageRating(Base):
     target_username = Column(String(50), nullable=True)
     
     # Timestamps
-    started_at = Column(DateTime, nullable=False, default=datetime.now(timezone.utc))
+    started_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     completed_at = Column(DateTime, nullable=True)
 
 
@@ -225,4 +225,3 @@ class MessageFeatures(Base):
             name="uq_extraction_message_run",
         ),
     )
-

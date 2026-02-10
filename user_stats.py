@@ -39,15 +39,28 @@ def ensure_user_stats_schema() -> None:
     Ensure the user stats schema has the latest columns/tables.
     Safe to call repeatedly; no-ops if already migrated.
     """
+    # Ensure base tables exist before attempting column inspection/migration.
+    init_db()
+
     inspector = inspect(engine)
-    existing_columns = {col["name"] for col in inspector.get_columns("user_stats")}
+    existing_tables = set(inspector.get_table_names())
+
+    if "user_stats" not in existing_tables:
+        Base.metadata.create_all(bind=engine)
+        inspector = inspect(engine)
+        existing_tables = set(inspector.get_table_names())
+
+    existing_columns = (
+        {col["name"] for col in inspector.get_columns("user_stats")}
+        if "user_stats" in existing_tables
+        else set()
+    )
     if "display_name" not in existing_columns:
         # Add the missing column for display names
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE user_stats ADD COLUMN display_name VARCHAR(100)"))
 
     # Create co-occurrence table if it doesn't exist
-    existing_tables = set(inspector.get_table_names())
     if "user_co_occurrences" not in existing_tables:
         # Import models already done; create_all will no-op on existing tables
         Base.metadata.create_all(bind=engine)
