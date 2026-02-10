@@ -515,13 +515,16 @@ class ExcelsiorBot(discord.Bot):
 
         # Copy at time of call to avoid race conditions
         store_history_copy = self.message_store.get_whole_history(channel.id)
+        # Keep only the newest MESSAGES_PER_CHECK messages eligible for flagging.
+        # Older messages in the history window are context-only.
+        context_only_message_count = max(0, len(store_history_copy) - MESSAGES_PER_CHECK)
 
         candidates = await get_candidate_features(
             self.message_store,
             channel.id,
             provider=DEFAULT_LLM_PROVIDER,
             model=DEFAULT_LLM_MODEL,
-            ignore_first_message_count=MESSAGES_PER_CHECK,
+            ignore_first_message_count=context_only_message_count,
         )
         result.candidates_considered = len(candidates)
 
@@ -558,9 +561,8 @@ class ExcelsiorBot(discord.Bot):
             result.reason = "No candidates with Discord message IDs were found."
             return result
 
-        # Filter out candidates that are too close to the beginning of the channel history
-        # since the model is unlikely to have enough context to extract good features
-        # This is redundant, but can't hurt
+        # Filter out candidates that fall in the context-only prefix of the current
+        # history window. This mirrors ignore_first_message_count above.
         def _safe_message_index(candidate: dict) -> int:
             # Coerce message_id to int to tolerate string or missing values
             try:
@@ -597,7 +599,7 @@ class ExcelsiorBot(discord.Bot):
                 count_waiver += 1
                 continue
 
-            if _safe_message_index(candidate) <= MESSAGES_PER_CHECK:  # message_id is 1-based index
+            if _safe_message_index(candidate) <= context_only_message_count:  # message_id is 1-based index
                 count_too_close += 1
                 continue
 
