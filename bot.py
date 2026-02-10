@@ -531,11 +531,22 @@ class ExcelsiorBot(discord.Bot):
             channel.id,
         )
 
+        # Track how many each filter removes (for logging when no candidates remain)
+        filter_counts: dict[str, int] = {}
+
         # Filter anything with discusses_ellie > 0.2 since that's likely bot-related noise
+        before_ellie = len(candidates)
         candidates = [candidate for candidate in candidates if candidate["features"]["discusses_ellie"] <= 0.2]
+        removed = before_ellie - len(candidates)
+        if removed > 0:
+            filter_counts["discusses_ellie"] = removed
 
         # Filter out candidates that don't have a resolved discord_message_id
+        before_discord_id = len(candidates)
         candidates = [c for c in candidates if c.get("discord_message_id") is not None]
+        removed = before_discord_id - len(candidates)
+        if removed > 0:
+            filter_counts["discord_message_id"] = removed
 
         if not candidates:
             logger.info(
@@ -569,27 +580,42 @@ class ExcelsiorBot(discord.Bot):
 
         # Keep candidate/message pairs aligned through all downstream filtering.
         filtered_pairs: list[tuple[dict, discord.Message]] = []
+        count_message_not_in_history = 0
+        count_waiver = 0
+        count_too_close = 0
         for candidate in candidates:
             candidate_message = next(
                 (msg for msg in store_history_copy if msg.id == candidate["discord_message_id"]),
                 None,
             )
             if candidate_message is None:
+                count_message_not_in_history += 1
                 continue
 
             target_user_id = candidate.get("target_user_id")
             if isinstance(target_user_id, int) and target_user_id in waiver_target_user_ids:
+                count_waiver += 1
                 continue
 
             if _safe_message_index(candidate) <= MESSAGES_PER_CHECK:  # message_id is 1-based index
+                count_too_close += 1
                 continue
 
             filtered_pairs.append((candidate, candidate_message))
 
+        if count_message_not_in_history > 0:
+            filter_counts["message_not_in_history"] = count_message_not_in_history
+        if count_waiver > 0:
+            filter_counts["waiver"] = count_waiver
+        if count_too_close > 0:
+            filter_counts["too_close_to_beginning"] = count_too_close
+
         if not filtered_pairs:
+            filter_summary = ", ".join(f"{name}: {n}" for name, n in filter_counts.items())
             logger.info(
-                "No candidates remain after moderation filters for channel %s",
+                "No candidates remain after moderation filters for channel %s (filtered out: %s)",
                 channel.id,
+                filter_summary if filter_summary else "none",
             )
             result.candidates_after_filters = 0
             result.success = True
