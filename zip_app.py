@@ -3,6 +3,7 @@ ZipApp - Creates a zip archive containing all Git-tracked files, the database fi
 Uses Git itself to determine which files to include, ensuring robustness and consistency with version control.
 """
 
+import argparse
 import subprocess
 import zipfile
 from pathlib import Path
@@ -45,12 +46,13 @@ def get_git_tracked_files(root_path):
         return []
 
 
-def create_zip_archive(output_name='excelsior_bot.zip'):
+def create_zip_archive(output_name='excelsior_bot.zip', code_only=False):
     """
     Create a zip archive containing all Git-tracked files, the database file, .env file, lightgbm model, and rating metadata.
     
     Args:
         output_name: Name of the output zip file
+        code_only: If True, include only Git-tracked files (skip database, .env, model, rating metadata)
     """
     root_path = Path(__file__).parent.resolve()
     
@@ -65,41 +67,45 @@ def create_zip_archive(output_name='excelsior_bot.zip'):
     # Files to include
     files_to_include = list(tracked_files)
     
-    # Add database file if it exists
-    database_file = root_path / 'excelsior.db'
-    if database_file.exists():
-        if database_file not in files_to_include:
-            files_to_include.append(database_file)
-            print(f"Added database file: {database_file.name}")
+    # Add data files unless --code-only
+    if not code_only:
+        # Add database file if it exists
+        database_file = root_path / 'excelsior.db'
+        if database_file.exists():
+            if database_file not in files_to_include:
+                files_to_include.append(database_file)
+                print(f"Added database file: {database_file.name}")
+        else:
+            print(f"Warning: Database file {database_file.name} not found.")
+        
+        # Add .env file if it exists
+        env_file = root_path / '.env'
+        if env_file.exists():
+            if env_file not in files_to_include:
+                files_to_include.append(env_file)
+                print(f"Added environment file: {env_file.name}")
+        else:
+            print(f"Warning: Environment file {env_file.name} not found.")
+        
+        # Add lightgbm model file if it exists
+        model_file = root_path / 'models' / 'lightgbm_model.joblib'
+        if model_file.exists():
+            if model_file not in files_to_include:
+                files_to_include.append(model_file)
+                print(f"Added model file: {model_file.relative_to(root_path)}")
+        else:
+            print(f"Warning: Model file {model_file.relative_to(root_path)} not found.")
+        
+        # Add rating metadata file if it exists
+        rating_metadata_file = root_path / 'data' / 'rating_metadata.json'
+        if rating_metadata_file.exists():
+            if rating_metadata_file not in files_to_include:
+                files_to_include.append(rating_metadata_file)
+                print(f"Added rating metadata file: {rating_metadata_file.relative_to(root_path)}")
+        else:
+            print(f"Warning: Rating metadata file {rating_metadata_file.relative_to(root_path)} not found.")
     else:
-        print(f"Warning: Database file {database_file.name} not found.")
-    
-    # Add .env file if it exists
-    env_file = root_path / '.env'
-    if env_file.exists():
-        if env_file not in files_to_include:
-            files_to_include.append(env_file)
-            print(f"Added environment file: {env_file.name}")
-    else:
-        print(f"Warning: Environment file {env_file.name} not found.")
-    
-    # Add lightgbm model file if it exists
-    model_file = root_path / 'models' / 'lightgbm_model.joblib'
-    if model_file.exists():
-        if model_file not in files_to_include:
-            files_to_include.append(model_file)
-            print(f"Added model file: {model_file.relative_to(root_path)}")
-    else:
-        print(f"Warning: Model file {model_file.relative_to(root_path)} not found.")
-    
-    # Add rating metadata file if it exists
-    rating_metadata_file = root_path / 'data' / 'rating_metadata.json'
-    if rating_metadata_file.exists():
-        if rating_metadata_file not in files_to_include:
-            files_to_include.append(rating_metadata_file)
-            print(f"Added rating metadata file: {rating_metadata_file.relative_to(root_path)}")
-    else:
-        print(f"Warning: Rating metadata file {rating_metadata_file.relative_to(root_path)} not found.")
+        print("Code-only mode: skipping database, .env, model, and rating metadata")
     
     # Skip the zip file itself if it exists
     zip_path = root_path / output_name
@@ -126,4 +132,7 @@ def create_zip_archive(output_name='excelsior_bot.zip'):
 
 
 if __name__ == '__main__':
-    create_zip_archive()
+    parser = argparse.ArgumentParser(description='Create a zip archive of the Excelsior Moderator project.')
+    parser.add_argument('--code-only', action='store_true', help='Include only Git-tracked files (skip database, .env, model, rating metadata)')
+    args = parser.parse_args()
+    create_zip_archive(code_only=args.code_only)
