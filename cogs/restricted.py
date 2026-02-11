@@ -156,6 +156,51 @@ class Restricted(commands.Cog):
 
         return [(author_id, flagged_count) for author_id, flagged_count in leaderboard_rows]
 
+    def _get_recent_flagged_messages(
+        self,
+        guild_id: int,
+        limit: int,
+        include_waiver_filtered: bool,
+    ) -> list[tuple[int, int, int, datetime, bool]]:
+        """
+        Fetch the most recent flagged messages for a single guild.
+
+        Args:
+            guild_id: Guild ID used to scope results to the current server
+            limit: Maximum number of flagged message rows to return
+            include_waiver_filtered: Whether rows marked waiver-filtered should be included
+
+        Returns:
+            List of tuples containing (message_id, channel_id, author_id, flagged_at, waiver_filtered)
+            sorted by newest first
+        """
+        session = self.get_db_session()
+        try:
+            # Query only the fields needed for the moderator list to keep memory usage low
+            recent_query = (
+                session.query(
+                    FlaggedMessage.message_id,
+                    FlaggedMessage.channel_id,
+                    FlaggedMessage.author_id,
+                    FlaggedMessage.flagged_at,
+                    FlaggedMessage.waiver_filtered,
+                )
+                .filter(FlaggedMessage.guild_id == guild_id)
+            )
+
+            # Allow moderators to include or exclude waiver-filtered rows on demand
+            if not include_waiver_filtered:
+                recent_query = recent_query.filter(FlaggedMessage.waiver_filtered.is_(False))
+
+            recent_rows = recent_query.order_by(FlaggedMessage.flagged_at.desc()).limit(limit).all()
+        finally:
+            session.close()
+
+        return [
+            (message_id, channel_id, author_id, flagged_at, waiver_filtered)
+            for message_id, channel_id, author_id, flagged_at, waiver_filtered in recent_rows
+        ]
+
     @discord.slash_command(name="mod_ping", description="Moderator-only ping command")
     @is_moderator()
     async def mod_ping(self, ctx: discord.ApplicationContext):
@@ -342,6 +387,81 @@ class Restricted(commands.Cog):
                 inline=False,
             )
 
+        await ctx.respond(embed=embed, ephemeral=True)
+
+    @discord.slash_command(
+        name="mod_flag_recent",
+        description="Show the most recent flagged messages with jump links",
+    )
+    @is_moderator()
+    async def mod_flag_recent(
+        self,
+        ctx: discord.ApplicationContext,
+        count: int = 10,
+        include_waiver_filtered: bool = True,
+    ):
+        """
+        Show the most recent flagged messages for the current guild.
+
+        Args:
+            ctx: Discord application context for the command
+            count: Number of recent flagged messages to show
+            include_waiver_filtered: Whether to include waiver-filtered flagged messages
+        """
+        # Keep the response readable and under Discord embed limits
+        if count < 1 or count > 25:
+            await ctx.respond(
+                "Please provide a count between 1 and 25.",
+                ephemeral=True,
+            )
+            return
+
+        if ctx.guild is None:
+            await ctx.respond(
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        recent_rows = self._get_recent_flagged_messages(
+            guild_id=ctx.guild.id,
+            limit=count,
+            include_waiver_filtered=include_waiver_filtered,
+        )
+        if not recent_rows:
+            await ctx.respond(
+                "No flagged messages found for this server.",
+                ephemeral=True,
+            )
+            return
+
+        # Build one concise line per flagged message with direct jump URLs
+        recent_lines = [
+            (
+                f"{index}. <@{author_id}> in <#{channel_id}> at "
+                f"<t:{int(flagged_at.timestamp())}:R> - "
+                f"[Jump](https://discord.com/channels/{ctx.guild.id}/{channel_id}/{message_id})"
+                f"{' (waiver filtered)' if waiver_filtered else ''}"
+            )
+            for index, (message_id, channel_id, author_id, flagged_at, waiver_filtered)
+            in enumerate(recent_rows, start=1)
+        ]
+
+        embed = discord.Embed(
+            title=f"Most Recent Flagged Messages ({len(recent_rows)})",
+            description="\n".join(recent_lines),
+            color=discord.Color.orange(),
+        )
+        embed.add_field(
+            name="Guild Scope",
+            value=ctx.guild.name,
+            inline=False,
+        )
+        embed.add_field(
+            name="Include Waiver-Filtered",
+            value="Yes" if include_waiver_filtered else "No",
+            inline=False,
+        )
         await ctx.respond(embed=embed, ephemeral=True)
 
     @discord.slash_command(name="check", description="Manually trigger moderation for this channel or thread")
