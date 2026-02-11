@@ -159,6 +159,8 @@ familiarity_score_stat = co_occurrence_count / (co_occurrence_count + 10)
 **`cogs/restricted.py`**: Admin/moderator commands
 - `/check` for manual moderation (moderator role)
 - `/retrain` for forced model retraining (admin role only)
+- `/mod_flag_analytics` for guild-scoped flagged-count analytics (default: last 1 day)
+- `/mod_flag_leaderboard` for top flagged members (default: last 30 days)
 - Moderator and admin permission checks
 
 **`cogs/public.py`**: Public utility commands
@@ -265,16 +267,19 @@ New model used on next moderation run
 2. **Filter candidates**:
    - Remove messages with `discusses_ellie > 0.2` (bot-related noise)
    - Remove messages without Discord IDs
-   - Remove messages that target users with the "Criticism Pass" role
+   - Waiver-role handling is configurable:
+     - `SAVE_WAIVER_FILTERED_FLAGS=True`: keep waived-target flags for analytics/training
+     - `SAVE_WAIVER_FILTERED_FLAGS=False`: drop waived-target candidates (legacy behavior)
    - Remove messages too close to channel start (insufficient context)
 3. **Extract features**: LLM provides 15 semantic features per candidate
 4. **Augment with stats**: Add 3 database-derived features (seniority, familiarity)
 5. **Predict**: LightGBM classifier predicts "flag" or "no-flag"
 6. **Flag actions**:
-   - Add 👁️ reaction to original message
-   - Post to log channel with rating buttons
+   - Add 👁️ reaction to original message (only when no waiver suppression applies)
+   - Post to log channel with rating buttons (only when no waiver suppression applies)
    - Save to `FlaggedMessage` table
    - Save runtime features to `MessageFeatures` (with `extraction_run_id=NULL`)
+   - For waived targets in persistence mode, keep DB rows but suppress Discord-facing moderation actions
 
 ### 3. Model Retraining
 
@@ -431,8 +436,12 @@ Messages flagged by the bot.
 - `target_user_id` (BigInteger, Nullable): Target user if message was directed at someone
 - `target_display_name` (String, Nullable): Target user display name
 - `target_username` (String, Nullable): Target user username
+- `was_acted_upon` (Boolean): Whether the bot took moderation action in Discord
+- `waiver_filtered` (Boolean): Whether moderation action was suppressed due to waiver role
 
 **Indexes**: `message_id` (unique)
+
+**Migration Note**: On startup, additive schema migration in `db_config.py` automatically backfills missing `was_acted_upon`/`waiver_filtered` columns for older SQLite databases.
 
 #### `flagged_message_ratings`
 
@@ -545,6 +554,7 @@ RATING_CHANNEL_ID         # Public channel for rating system (required)
 RATING_SYSTEM_LOG_FILE    # Filename for historical ratings (default: "rating_system_log.json")
 WAIVER_ROLE_NAME          # Role name that exempts users from flagging (default: "Criticism Pass")
 MODERATOR_ROLES           # List of moderator role names for restricted commands
+ADMIN_ROLE                # Single admin role used for `/retrain` authorization
 ```
 
 **Channel Setup**:
@@ -559,6 +569,7 @@ MESSAGES_PER_CHECK        # Messages before auto-check (default: 30)
 HISTORY_PER_CHECK         # Messages of history sent to LLM (default: 40)
 SECS_BETWEEN_AUTO_CHECKS  # Idle timeout before auto-check (default: 240 seconds = 4 minutes)
 REACTION_EMOJI            # Emoji added to flagged messages (default: 👁️)
+SAVE_WAIVER_FILTERED_FLAGS # Keep waived-target rows in DB while suppressing Discord action
 ```
 
 **Tuning Guidelines**:
@@ -590,6 +601,9 @@ NEW_RATINGS_BEFORE_RETRAIN                   # Ratings before auto-retrain (defa
 CONTINUOUS_TRAINING_FEATURE_MODE             # "existing_only" or "extract_on_demand"
 CONTINUOUS_TRAINING_COLLAPSE_CATEGORIES      # Collapse to binary flag/no-flag (default: True)
 CONTINUOUS_TRAINING_COLLAPSE_AMBIGUOUS       # Map ambiguous to no-flag (default: True)
+EXCLUDE_WAIVER_FILTERED_FROM_RATE_POOL       # Exclude waived-target rows from `/rate` pool
+EXCLUDE_WAIVER_FILTERED_FROM_COVERAGE        # Exclude waived-target rows from coverage denominators
+EXCLUDE_WAIVER_FILTERED_FROM_TRAINING        # Exclude waived-target rows from training dataset
 ```
 
 **Training Modes**:
@@ -597,6 +611,10 @@ CONTINUOUS_TRAINING_COLLAPSE_AMBIGUOUS       # Map ambiguous to no-flag (default
 - **`extract_on_demand`**: Extracts only missing features via LLM (expensive when many are missing)
   - Uses `flagged_messages` rows as source of truth
   - Falls back to Discord API context fetch when a row has empty/missing context
+
+**Waiver-aware dataset control**:
+- `EXCLUDE_WAIVER_FILTERED_FROM_TRAINING=True` keeps retraining focused on messages where moderation action was not waiver-suppressed
+- Similar exclusions are available independently for public rating pool and coverage analytics
 
 **Category Collapsing**:
 - **Binary mode** (recommended): Simpler classification, works with <2000 ratings
@@ -757,13 +775,17 @@ The bot will:
    /check        # Should analyze recent messages in current channel
    ```
 
-3. **Test rating system**:
+3. **Test moderator analytics** (requires moderator role):
+   ```
+   /mod_flag_analytics days:1
+   /mod_flag_leaderboard days:30 include_waiver_filtered:true include_all_flagged_messages:true
+   ```
+4. **Test rating system**:
    - Go to rating channel
    - Type `/rate`
    - Rate a flagged message
    - Check that rating is saved (use `/view_score`)
-
-4. **Test automatic moderation**:
+5. **Test automatic moderation**:
    - Send 30+ messages in a tracked channel
    - Bot should automatically run moderation check
    - Check console logs for feature extraction and prediction
@@ -1310,5 +1332,5 @@ For issues or questions:
 
 ---
 
-**Document Version**: 1.0  
-**Last Updated**: 2026-02-09
+**Document Version**: 1.1  
+**Last Updated**: 2026-02-10
