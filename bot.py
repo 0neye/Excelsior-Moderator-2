@@ -16,6 +16,7 @@ from config import (
     CHANNEL_ALLOW_LIST,
     MESSAGES_PER_CHECK,
     WAIVER_ROLE_NAME,
+    SAVE_WAIVER_FILTERED_FLAGS,
     REACTION_EMOJI,
     LOG_CHANNEL_ID,
     SECS_BETWEEN_AUTO_CHECKS,
@@ -571,8 +572,9 @@ class ExcelsiorBot(discord.Bot):
                 return 0
 
         # Build a lookup of users who currently hold the waiver role
-        # Waiver handling is applied at the action step so waived targets are
-        # still persisted to the database with explicit metadata
+        # Behavior is configurable:
+        # - SAVE_WAIVER_FILTERED_FLAGS=True: keep waived flags in DB, suppress Discord action
+        # - SAVE_WAIVER_FILTERED_FLAGS=False: drop waived targets early (legacy behavior)
         waiver_target_user_ids: set[int] = set()
         waiver_role = next(
             (role for role in channel.guild.roles if role.name == WAIVER_ROLE_NAME),
@@ -584,6 +586,7 @@ class ExcelsiorBot(discord.Bot):
         # Keep candidate/message pairs aligned through all downstream filtering.
         filtered_pairs: list[tuple[dict, discord.Message]] = []
         count_message_not_in_history = 0
+        count_waiver = 0
         count_too_close = 0
         for candidate in candidates:
             candidate_message = next(
@@ -594,6 +597,15 @@ class ExcelsiorBot(discord.Bot):
                 count_message_not_in_history += 1
                 continue
 
+            target_user_id = candidate.get("target_user_id")
+            if (
+                not SAVE_WAIVER_FILTERED_FLAGS
+                and isinstance(target_user_id, int)
+                and target_user_id in waiver_target_user_ids
+            ):
+                count_waiver += 1
+                continue
+
             if _safe_message_index(candidate) <= context_only_message_count:  # message_id is 1-based index
                 count_too_close += 1
                 continue
@@ -602,6 +614,8 @@ class ExcelsiorBot(discord.Bot):
 
         if count_message_not_in_history > 0:
             filter_counts["message_not_in_history"] = count_message_not_in_history
+        if count_waiver > 0:
+            filter_counts["waiver"] = count_waiver
         if count_too_close > 0:
             filter_counts["too_close_to_beginning"] = count_too_close
 
@@ -717,14 +731,20 @@ class ExcelsiorBot(discord.Bot):
             
             for candidate, candidate_message, prediction in zip(candidates, candidate_messages, predictions):
                 if prediction == "flag" and candidate_message is not None:
-                    # Waiver filtering is intentionally applied at the final action step
-                    # This keeps the flagged row for analytics/training while preventing
-                    # reactions and log-channel posts for waived targets
+                    # Apply waiver handling at action-time only when configured to
+                    # persist waived flags for analytics and training
                     target_user_id = candidate.get("target_user_id")
                     is_waiver_filtered = (
-                        isinstance(target_user_id, int)
+                        SAVE_WAIVER_FILTERED_FLAGS
+                        and isinstance(target_user_id, int)
                         and target_user_id in waiver_target_user_ids
                     )
+                    if (
+                        not SAVE_WAIVER_FILTERED_FLAGS
+                        and isinstance(target_user_id, int)
+                        and target_user_id in waiver_target_user_ids
+                    ):
+                        continue
 
                     # Skip flag insert when it already exists, but still consider persisting features
                     if candidate_message.id not in existing_flagged_ids:

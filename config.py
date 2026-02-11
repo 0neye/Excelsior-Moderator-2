@@ -33,6 +33,10 @@ OTHER_ROLES = ["Architect", "Artisan", "Visionary"]
 
 # The role for people who don't care about harsh feedback
 WAIVER_ROLE_NAME = "Criticism Pass"
+# Toggle waiver-target persistence behavior in moderation:
+# - True keeps waived-target flagged rows in DB and suppresses Discord action
+# - False drops waived-target candidates early (legacy behavior)
+SAVE_WAIVER_FILTERED_FLAGS = True
 
 DB_FILE = "excelsior.db"
 
