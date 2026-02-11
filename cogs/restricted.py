@@ -3,17 +3,17 @@
 from typing import TYPE_CHECKING
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import discord
 from discord.ext import commands
+from sqlalchemy import func
 
-from config import MODERATOR_ROLES
+from config import ADMIN_ROLE, MODERATOR_ROLES
+from database import FlaggedMessage, FlaggedMessageRating, RatingCategory
 from utils import is_tracked_channel
 
 if TYPE_CHECKING:
     from bot import ModerationResult
-
-
-ADMIN_ROLE = "Custodian (admin)"
 
 
 def is_moderator():
@@ -52,6 +52,110 @@ class Restricted(commands.Cog):
         self.message_store = bot.message_store
         self.get_db_session = bot.get_db_session
 
+    def _get_flagged_message_counts(self, guild_id: int, days: int) -> tuple[int, int]:
+        """
+        Count recently flagged messages and waiver-filtered messages.
+
+        Args:
+            guild_id: Guild ID to scope analytics to the active server
+            days: Number of trailing days to include in the analytics window
+
+        Returns:
+            Tuple of (total_flagged_count, waiver_filtered_count)
+        """
+        # Build an absolute UTC cutoff so time-window logic is consistent
+        cutoff_timestamp = datetime.now(timezone.utc) - timedelta(days=days)
+
+        session = self.get_db_session()
+        try:
+            # Apply one shared time filter so both counts use the same window
+            base_query = session.query(FlaggedMessage).filter(
+                FlaggedMessage.guild_id == guild_id,
+                FlaggedMessage.flagged_at >= cutoff_timestamp
+            )
+
+            # Count all flagged messages in the requested timeframe
+            total_flagged_count = base_query.count()
+
+            # Count only records marked as waiver-filtered in that same timeframe
+            waiver_filtered_count = base_query.filter(
+                FlaggedMessage.waiver_filtered.is_(True)
+            ).count()
+        finally:
+            session.close()
+
+        return total_flagged_count, waiver_filtered_count
+
+    def _get_flagged_author_leaderboard(
+        self,
+        guild_id: int,
+        days: int,
+        include_waiver_filtered: bool,
+        include_all_flagged_messages: bool,
+        limit: int = 10,
+    ) -> list[tuple[int, int]]:
+        """
+        Build a leaderboard of authors with the most flagged messages.
+
+        Args:
+            guild_id: Guild ID to scope the leaderboard to the active server
+            days: Number of trailing days to include in the leaderboard window
+            include_waiver_filtered: Whether to include waiver-filtered flag rows
+            include_all_flagged_messages: If False, only count flags with confirming ratings
+            limit: Maximum number of leaderboard rows to return
+
+        Returns:
+            List of (author_id, flagged_count) sorted by count descending
+        """
+        session = self.get_db_session()
+        try:
+            # Build an absolute UTC cutoff so timeframe filtering is deterministic
+            cutoff_timestamp = datetime.now(timezone.utc) - timedelta(days=days)
+
+            # Start from all flagged messages for this guild so cross-server rows are excluded
+            flagged_query = session.query(FlaggedMessage).filter(
+                FlaggedMessage.guild_id == guild_id,
+                FlaggedMessage.flagged_at >= cutoff_timestamp,
+            )
+
+            # Optionally remove waiver-filtered rows when building the ranking
+            if not include_waiver_filtered:
+                flagged_query = flagged_query.filter(FlaggedMessage.waiver_filtered.is_(False))
+
+            # Optionally keep only rows that have at least one rating confirming the flag
+            if not include_all_flagged_messages:
+                confirming_rating_message_ids = (
+                    session.query(FlaggedMessageRating.flagged_message_id)
+                    .filter(
+                        FlaggedMessageRating.category.in_(
+                            [RatingCategory.UNCONSTRUCTIVE, RatingCategory.UNSOLICITED]
+                        )
+                    )
+                    .distinct()
+                    .subquery()
+                )
+                flagged_query = flagged_query.filter(
+                    FlaggedMessage.message_id.in_(
+                        session.query(confirming_rating_message_ids.c.flagged_message_id)
+                    )
+                )
+
+            # Aggregate by author to rank the members most frequently flagged
+            leaderboard_rows = (
+                flagged_query.with_entities(
+                    FlaggedMessage.author_id,
+                    func.count(FlaggedMessage.id).label("flagged_count"),
+                )
+                .group_by(FlaggedMessage.author_id)
+                .order_by(func.count(FlaggedMessage.id).desc())
+                .limit(limit)
+                .all()
+            )
+        finally:
+            session.close()
+
+        return [(author_id, flagged_count) for author_id, flagged_count in leaderboard_rows]
+
     @discord.slash_command(name="mod_ping", description="Moderator-only ping command")
     @is_moderator()
     async def mod_ping(self, ctx: discord.ApplicationContext):
@@ -71,6 +175,173 @@ class Restricted(commands.Cog):
         if isinstance(ctx.author, discord.Member):
             embed.add_field(name="Your Roles", value=", ".join([r.name for r in ctx.author.roles if r.name != "@everyone"]), inline=False)
         
+        await ctx.respond(embed=embed, ephemeral=True)
+
+    @discord.slash_command(
+        name="mod_flag_analytics",
+        description="View flagged message counts for a timeframe",
+    )
+    @is_moderator()
+    async def mod_flag_analytics(
+        self,
+        ctx: discord.ApplicationContext,
+        days: int = 1,
+    ):
+        """
+        Show flagged message analytics for the last N days.
+
+        Args:
+            ctx: Discord application context for the command
+            days: Number of trailing days to include in the report
+        """
+        # Guard against invalid or extreme values that don't make operational sense
+        if days < 1:
+            await ctx.respond(
+                "Please provide a timeframe of at least 1 day.",
+                ephemeral=True,
+            )
+            return
+
+        if ctx.guild is None:
+            await ctx.respond(
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        # Query aggregate counts for the same timeframe window
+        total_flagged_count, waiver_filtered_count = self._get_flagged_message_counts(
+            guild_id=ctx.guild.id,
+            days=days,
+        )
+        waiver_percentage = (
+            (waiver_filtered_count / total_flagged_count) * 100
+            if total_flagged_count
+            else 0.0
+        )
+
+        # Present the analytics in an embed for readability
+        embed = discord.Embed(
+            title="Flagged Message Analytics",
+            color=discord.Color.orange(),
+        )
+        embed.add_field(
+            name="Timeframe",
+            value=f"Last {days} day{'s' if days != 1 else ''}",
+            inline=False,
+        )
+        embed.add_field(
+            name="Total Flagged Messages",
+            value=str(total_flagged_count),
+            inline=True,
+        )
+        embed.add_field(
+            name="Waiver-Filtered Flags",
+            value=f"{waiver_filtered_count} ({waiver_percentage:.1f}%)",
+            inline=True,
+        )
+
+        await ctx.respond(embed=embed, ephemeral=True)
+
+    @discord.slash_command(
+        name="mod_flag_leaderboard",
+        description="Show top members most frequently flagged by moderation",
+    )
+    @is_moderator()
+    async def mod_flag_leaderboard(
+        self,
+        ctx: discord.ApplicationContext,
+        days: int = 30,
+        include_waiver_filtered: bool = True,
+        include_all_flagged_messages: bool = True,
+    ):
+        """
+        Show the top 10 members most likely to be flagged by the bot.
+
+        Args:
+            ctx: Discord application context for the command
+            days: Number of trailing days to include in the leaderboard
+            include_waiver_filtered: Whether to include waiver-filtered flagged messages
+            include_all_flagged_messages: Whether to include all flagged rows instead of only confirmed ones
+        """
+        # Ensure timeframe input is valid before running DB queries
+        if days < 1:
+            await ctx.respond(
+                "Please provide a timeframe of at least 1 day.",
+                ephemeral=True,
+            )
+            return
+
+        if ctx.guild is None:
+            await ctx.respond(
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        # Pull a wider pool first, then keep the top ten current guild members
+        leaderboard_rows = self._get_flagged_author_leaderboard(
+            guild_id=ctx.guild.id,
+            days=days,
+            include_waiver_filtered=include_waiver_filtered,
+            include_all_flagged_messages=include_all_flagged_messages,
+            limit=100,
+        )
+
+        if not leaderboard_rows:
+            await ctx.respond(
+                "No flagged message data matched the selected filters.",
+                ephemeral=True,
+            )
+            return
+
+        # Keep leaderboard scoped to current server members as requested
+        top_member_rows = [
+            (author_id, flagged_count)
+            for author_id, flagged_count in leaderboard_rows
+            if ctx.guild.get_member(author_id) is not None
+        ][:10]
+
+        if not top_member_rows:
+            await ctx.respond(
+                "No current server members matched the selected filters.",
+                ephemeral=True,
+            )
+            return
+
+        # Render a compact top-10 leaderboard with mentions for easy moderation follow-up
+        leaderboard_lines = [
+            f"{rank}. <@{author_id}> - {flagged_count} flagged"
+            for rank, (author_id, flagged_count) in enumerate(top_member_rows, start=1)
+        ]
+
+        embed = discord.Embed(
+            title="Flag Likelihood Leaderboard",
+            description="\n".join(leaderboard_lines),
+            color=discord.Color.gold(),
+        )
+        embed.add_field(
+            name="Timeframe",
+            value=f"Last {days} day{'s' if days != 1 else ''}",
+            inline=True,
+        )
+        embed.add_field(
+            name="Include Waiver-Filtered",
+            value="Yes" if include_waiver_filtered else "No",
+            inline=True,
+        )
+        embed.add_field(
+            name="Include All Flagged",
+            value="Yes" if include_all_flagged_messages else "No (Confirmed only)",
+            inline=True,
+        )
+        if not include_all_flagged_messages:
+            embed.add_field(
+                name="Confirmed Rating Definition",
+                value="Rated as `unconstructive` or `unsolicited`",
+                inline=False,
+            )
+
         await ctx.respond(embed=embed, ephemeral=True)
 
     @discord.slash_command(name="check", description="Manually trigger moderation for this channel or thread")

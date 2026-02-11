@@ -28,6 +28,7 @@ RATING_CHANNEL_ID = 1439846071991013418
 RATING_SYSTEM_LOG_FILE = "rating_system_log.json"
 
 MODERATOR_ROLES = ["Sentinel (mod)", "Custodian (admin)"]
+ADMIN_ROLE = "Custodian (admin)"
 RANK_ROLES = ["Adept", "Expert", "Paragon"]
 OTHER_ROLES = ["Architect", "Artisan", "Visionary"]
 
