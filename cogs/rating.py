@@ -12,7 +12,13 @@ from discord.ext import commands
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from config import NEW_RATINGS_BEFORE_RETRAIN, RATING_CHANNEL_ID, get_logger
+from config import (
+    NEW_RATINGS_BEFORE_RETRAIN,
+    RATING_CHANNEL_ID,
+    EXCLUDE_WAIVER_FILTERED_FROM_RATE_POOL,
+    EXCLUDE_WAIVER_FILTERED_FROM_COVERAGE,
+    get_logger,
+)
 from database import FlaggedMessage, FlaggedMessageRating, LogChannelRatingPost, RatingCategory
 from utils import format_markdown_table
 
@@ -34,7 +40,6 @@ RATING_METADATA_FILE = Path(__file__).parent.parent / "data" / "rating_metadata.
 
 # Module-level logger
 logger = get_logger(__name__)
-
 
 def _load_rating_metadata() -> dict:
     """Load leaderboard metadata from JSON file."""
@@ -303,6 +308,67 @@ class Rating(commands.Cog):
         )
         return existing is not None
 
+    def _apply_rate_pool_filters(self, query):
+        """
+        Apply configured filters for records eligible in `/rate`.
+
+        Args:
+            query: SQLAlchemy query object that selects `FlaggedMessage` rows.
+
+        Returns:
+            The filtered query object.
+        """
+        # Keep public rating focused on messages where moderation action was taken
+        if EXCLUDE_WAIVER_FILTERED_FROM_RATE_POOL:
+            query = query.filter(FlaggedMessage.waiver_filtered.is_(False))
+        return query
+
+    def _count_flagged_for_coverage(self, session: Session) -> int:
+        """
+        Count flagged records used as coverage denominator.
+
+        Args:
+            session: DB session.
+
+        Returns:
+            Number of flagged messages counted for coverage metrics.
+        """
+        # Reuse shared filter helper so denominator and numerator stay consistent
+        query = self._apply_coverage_population_filters(session.query(FlaggedMessage))
+        return query.count()
+
+    def _apply_coverage_population_filters(self, query):
+        """
+        Apply coverage-denominator filters to queries over `FlaggedMessage`.
+
+        Args:
+            query: SQLAlchemy query rooted in `FlaggedMessage`.
+
+        Returns:
+            Filtered query object aligned to coverage population.
+        """
+        # Keep this centralized so numerator/denominator stay in lockstep
+        if EXCLUDE_WAIVER_FILTERED_FROM_COVERAGE:
+            query = query.filter(FlaggedMessage.waiver_filtered.is_(False))
+        return query
+
+    def _build_coverage_aligned_ratings_query(self, session: Session):
+        """
+        Build a ratings query scoped to the same population as coverage.
+
+        Args:
+            session: DB session.
+
+        Returns:
+            SQLAlchemy query over `FlaggedMessageRating` joined to `FlaggedMessage`.
+        """
+        # Join through FlaggedMessage so rating counts can honor waiver filters
+        ratings_query = session.query(FlaggedMessageRating).join(
+            FlaggedMessage,
+            FlaggedMessageRating.flagged_message_id == FlaggedMessage.message_id,
+        )
+        return self._apply_coverage_population_filters(ratings_query)
+
     def _get_random_least_rated_message(
         self, session: Session, exclude_user_id: Optional[int] = None
     ) -> Optional[FlaggedMessage]:
@@ -334,6 +400,7 @@ class Rating(commands.Cog):
             rating_counts,
             FlaggedMessage.message_id == rating_counts.c.flagged_message_id,
         )
+        query = self._apply_rate_pool_filters(query)
 
         # Exclude messages the user has already rated
         if exclude_user_id is not None:
@@ -388,6 +455,7 @@ class Rating(commands.Cog):
             rating_counts,
             FlaggedMessage.message_id == rating_counts.c.flagged_message_id,
         )
+        query = self._apply_rate_pool_filters(query)
 
         # Exclude messages the user has already rated
         if exclude_user_id is not None:
@@ -461,11 +529,11 @@ class Rating(commands.Cog):
             Dict with total_ratings, category_breakdown, rank, etc.
         """
         # Count user's ratings by category
-        user_ratings = (
-            session.query(FlaggedMessageRating)
-            .filter(FlaggedMessageRating.rater_user_id == user_id)
-            .all()
-        )
+        # Count only ratings in the same population used by coverage denominator
+        ratings_query = self._build_coverage_aligned_ratings_query(session)
+        user_ratings = ratings_query.filter(
+            FlaggedMessageRating.rater_user_id == user_id
+        ).all()
 
         total_ratings = len(user_ratings)
         category_counts = {cat: 0 for cat in RatingCategory}
@@ -473,13 +541,14 @@ class Rating(commands.Cog):
             if rating.category:
                 category_counts[rating.category] += 1
 
-        # Get total flagged messages
-        total_flagged = session.query(FlaggedMessage).count()
+        # Get total flagged messages that should count for coverage metrics
+        total_flagged = self._count_flagged_for_coverage(session)
         coverage_pct = (total_ratings / total_flagged * 100) if total_flagged > 0 else 0.0
 
         # Get user's rank
         all_counts = (
-            session.query(
+            self._build_coverage_aligned_ratings_query(session)
+            .with_entities(
                 FlaggedMessageRating.rater_user_id,
                 func.count(FlaggedMessageRating.id).label("count"),
             )
@@ -515,7 +584,8 @@ class Rating(commands.Cog):
             List of (user_id, rating_count) tuples.
         """
         results = (
-            session.query(
+            self._build_coverage_aligned_ratings_query(session)
+            .with_entities(
                 FlaggedMessageRating.rater_user_id,
                 func.count(FlaggedMessageRating.id).label("count"),
             )
@@ -642,7 +712,7 @@ class Rating(commands.Cog):
         session = self.get_db_session()
         try:
             top_raters = self._get_top_raters(session, limit=10)
-            total_flagged = session.query(FlaggedMessage).count()
+            total_flagged = self._count_flagged_for_coverage(session)
         finally:
             session.close()
 
@@ -872,7 +942,7 @@ Use `/view_score` to see your personal statistics."""
                     selection_method = "least_rated (fallback)"
 
             if not message_record:
-                total_flagged = session.query(FlaggedMessage).count()
+                total_flagged = self._count_flagged_for_coverage(session)
                 logger.info(
                     "/rate invoked by user %s but no flagged messages available (total=%s)",
                     ctx.author.id,

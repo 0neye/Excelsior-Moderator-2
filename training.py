@@ -15,6 +15,7 @@ from config import (
     CONTINUOUS_TRAINING_FEATURE_MODE,
     CONTINUOUS_TRAINING_COLLAPSE_CATEGORIES,
     CONTINUOUS_TRAINING_COLLAPSE_AMBIGUOUS,
+    EXCLUDE_WAIVER_FILTERED_FROM_TRAINING,
     DEFAULT_LLM_MODEL,
     DEFAULT_LLM_PROVIDER,
     get_logger,
@@ -108,27 +109,38 @@ def load_all_features_from_db() -> dict[int, list[dict[str, float]]]:
         session.close()
 
 
-def load_rated_messages_from_db() -> list[dict]:
+def load_rated_messages_from_db(
+    exclude_waiver_filtered: bool | None = None
+) -> list[dict]:
     """
     Load all rated messages with their ratings from the database.
+
+    Args:
+        exclude_waiver_filtered: Whether to exclude flagged messages that were
+            suppressed due to the waiver role. Uses config default when None
 
     Returns:
         List of dicts with message info and rating category
     """
     init_db()
     session = get_session()
+    if exclude_waiver_filtered is None:
+        exclude_waiver_filtered = EXCLUDE_WAIVER_FILTERED_FROM_TRAINING
 
     try:
         # Query flagged messages that have completed ratings
-        results = (
+        rated_query = (
             session.query(FlaggedMessage, FlaggedMessageRating)
             .join(
                 FlaggedMessageRating,
                 FlaggedMessage.message_id == FlaggedMessageRating.flagged_message_id,
             )
             .filter(FlaggedMessageRating.category.isnot(None))
-            .all()
         )
+        # Keep training aligned with moderation decisions unless explicitly disabled
+        if exclude_waiver_filtered:
+            rated_query = rated_query.filter(FlaggedMessage.waiver_filtered.is_(False))
+        results = rated_query.all()
 
         rated_messages = []
         for flagged_msg, rating in results:
@@ -140,7 +152,11 @@ def load_rated_messages_from_db() -> list[dict]:
                 }
             )
 
-        logger.info("Loaded %d rated messages from database", len(rated_messages))
+        logger.info(
+            "Loaded %d rated messages from database (exclude_waiver_filtered=%s)",
+            len(rated_messages),
+            exclude_waiver_filtered,
+        )
         return rated_messages
 
     finally:

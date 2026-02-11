@@ -31,6 +31,9 @@ MODERATOR_ROLES = ["Sentinel (mod)", "Custodian (admin)"]
 RANK_ROLES = ["Adept", "Expert", "Paragon"]
 OTHER_ROLES = ["Architect", "Artisan", "Visionary"]
 
+# The role for people who don't care about harsh feedback
+WAIVER_ROLE_NAME = "Criticism Pass"
+
 DB_FILE = "excelsior.db"
 
 # How many messages to wait for before sending them to the llm for moderation
@@ -49,6 +52,12 @@ MODERATION_FAILURE_BACKOFF_MAX = 600
 
 # The number of new ratings before the classifier model is retrained
 NEW_RATINGS_BEFORE_RETRAIN = 20
+# Exclude waived-target records from the public `/rate` candidate pool
+EXCLUDE_WAIVER_FILTERED_FROM_RATE_POOL = True
+# Exclude waived-target records from coverage/stat denominators
+EXCLUDE_WAIVER_FILTERED_FROM_COVERAGE = True
+# Exclude waived-target records from continuous training datasets
+EXCLUDE_WAIVER_FILTERED_FROM_TRAINING = True
 
 # Feature extraction mode for continuous training:
 # - "existing_only": Only use messages with pre-extracted features (faster, no LLM cost)
@@ -64,8 +73,6 @@ CONTINUOUS_TRAINING_COLLAPSE_CATEGORIES = True
 # If collapsing is enabled, whether to map "ambiguous" to "no-flag" instead of keeping it separate
 CONTINUOUS_TRAINING_COLLAPSE_AMBIGUOUS = True
 
-# The role for people who don't care about harsh feedback
-WAIVER_ROLE_NAME = "Criticism Pass"
 
 # The guidelines for constructive criticism
 GUIDELINES = """

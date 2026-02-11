@@ -5,6 +5,7 @@ from sqlalchemy import (
     Column,
     Integer,
     BigInteger,
+    Boolean,
     String,
     Text,
     DateTime,
@@ -65,6 +66,10 @@ class FlaggedMessage(Base):
     target_user_id = Column(BigInteger, nullable=True)
     target_display_name = Column(String(100), nullable=True)
     target_username = Column(String(50), nullable=True)
+    # Tracks whether the bot took moderation action in Discord for this record
+    was_acted_upon = Column(Boolean, nullable=False, default=True)
+    # Marks records that were suppressed from Discord action due to waiver role
+    waiver_filtered = Column(Boolean, nullable=False, default=False)
 
 
 class FlaggedMessageRating(Base):

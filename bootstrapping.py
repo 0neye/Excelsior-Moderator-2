@@ -274,6 +274,9 @@ def load_flagged_messages_into_db() -> int:
                     context_messages=[],
                     timestamp=timestamp,
                     flagged_at=flagged_at,
+                    # Bootstrapped historical rows are treated as actionable by default
+                    was_acted_upon=True,
+                    waiver_filtered=False,
                 )
             )
             # Track inserted IDs to avoid duplicate inserts when the file repeats IDs
@@ -627,6 +630,9 @@ def save_to_database(rated_messages: list[RatedMessage]) -> None:
                     context_messages=rated_msg.context_messages,
                     timestamp=datetime.fromisoformat(rated_msg.timestamp.replace("Z", "+00:00")),
                     flagged_at=datetime.fromisoformat(rated_msg.flagged_at.replace("Z", "+00:00")),
+                    # Imported rated rows predate waiver metadata and should remain actionable
+                    was_acted_upon=True,
+                    waiver_filtered=False,
                 )
                 session.add(flagged_msg)
                 saved_count += 1
