@@ -31,7 +31,7 @@ from database import FlaggedMessage, LogChannelRatingPost, MessageFeatures
 from db_config import init_db, get_session
 from history import MessageStore
 from llms import get_candidate_features
-from ml import FEATURE_NAMES, load_classifier
+from ml import FEATURE_NAMES, ModelLoadError, load_classifier
 from utils import serialize_context_messages, is_tracked_channel
 
 # Set up intents for the bot
@@ -672,7 +672,17 @@ class ExcelsiorBot(discord.Bot):
             )
             result.reason = f"Model file not found at {model_path}"
             return result
-        classifier = load_classifier(model_path)
+        try:
+            classifier = load_classifier(model_path)
+        except ModelLoadError as exc:
+            # Keep scheduler healthy and report an actionable infrastructure error
+            logger.error(
+                "Model load failed for channel %s: %s",
+                channel.id,
+                exc,
+            )
+            result.reason = str(exc)
+            return result
         filter_out_feature_names = [] #["discusses_ellie", "includes_positive_takeaways"]
         # Align feature order with the model's training order; fall back to defaults
         model_feature_names = getattr(classifier, "feature_names", FEATURE_NAMES)

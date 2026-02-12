@@ -34,6 +34,10 @@ FEATURE_NAMES = [
 ]
 
 
+class ModelLoadError(RuntimeError):
+    """Raised when the persisted classifier cannot be loaded in this runtime."""
+
+
 class ModerationClassifier(ABC):
     """Abstract base class for moderation classifiers."""
 
@@ -282,4 +286,15 @@ def load_classifier(path: str | Path = "models/lightgbm_model.joblib") -> Modera
     Returns:
         Loaded classifier instance
     """
-    return LightGBMClassifier.load(path)
+    try:
+        return LightGBMClassifier.load(path)
+    except (OSError, ImportError, ModuleNotFoundError) as exc:
+        # Give operators a concrete package hint for the most common Linux runtime issue
+        if "libgomp.so.1" in str(exc):
+            raise ModelLoadError(
+                "Failed to load LightGBM runtime dependency libgomp.so.1. "
+                "Install libgomp1 on the host and restart the bot."
+            ) from exc
+        raise ModelLoadError(
+            f"Failed to load classifier at {path}: {exc}"
+        ) from exc
