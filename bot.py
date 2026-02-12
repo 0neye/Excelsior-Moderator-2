@@ -15,6 +15,7 @@ from config import (
     DISCORD_BOT_TOKEN,
     CHANNEL_ALLOW_LIST,
     MESSAGES_PER_CHECK,
+    NEW_MESSAGES_BEFORE_TIMER_START,
     WAIVER_ROLE_NAME,
     SAVE_WAIVER_FILTERED_FLAGS,
     REACTION_EMOJI,
@@ -141,6 +142,15 @@ class ExcelsiorBot(discord.Bot):
         if idle_remaining == 0:
             return cooldown_remaining
         return min(idle_remaining, cooldown_remaining)
+
+    def _get_idle_timer_start_threshold(self) -> int:
+        """
+        Return a safe minimum message threshold for starting the idle timer.
+
+        Returns:
+            Threshold value clamped to at least 1.
+        """
+        return max(1, NEW_MESSAGES_BEFORE_TIMER_START)
 
     def _register_moderation_failure(self, state: ChannelModerationState, reason: str) -> None:
         """
@@ -402,8 +412,11 @@ class ExcelsiorBot(discord.Bot):
         state = self._get_or_create_channel_state(channel.id)
         state.messages_since_check += 1
         state.most_recent_message_id = message.id
-        # Only start the idle timer and flag once per post-check batch
-        if not state.has_new_message_since_check:
+        # Only start the idle timer once per post-check batch after reaching threshold
+        if (
+            not state.has_new_message_since_check
+            and state.messages_since_check >= self._get_idle_timer_start_threshold()
+        ):
             state.has_new_message_since_check = True
             state.idle_timer_started_at = datetime.now(timezone.utc)
             logger.info(
@@ -411,6 +424,14 @@ class ExcelsiorBot(discord.Bot):
                 channel.id,
                 message.id,
                 getattr(message.author, "id", "unknown"),
+            )
+        elif not state.has_new_message_since_check:
+            # Defer timer startup until enough new messages accumulate in this channel
+            logger.debug(
+                "Idle timer not started for channel %s yet (%d/%d new messages since check)",
+                channel.id,
+                state.messages_since_check,
+                self._get_idle_timer_start_threshold(),
             )
 
         # Wake scheduler to consider thresholds immediately

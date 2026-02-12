@@ -50,6 +50,9 @@ HISTORY_PER_CHECK = 40
 # If there are new messages in a channel that haven't been checked, but not enough to trigger the above, check anyway after this time
 # Resets after a new message, and doesn't trigger if all messages in channel have already been checked
 SECS_BETWEEN_AUTO_CHECKS = 240
+# Minimum number of new messages required before starting the idle moderation timer
+# This helps avoid expensive checks for one-off chatter in low-activity channels
+NEW_MESSAGES_BEFORE_TIMER_START = 3
 
 # Backoff settings for failed moderation runs to prevent rapid retries.
 MODERATION_FAILURE_BACKOFF_BASE = 30
