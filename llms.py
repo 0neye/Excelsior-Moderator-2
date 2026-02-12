@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from typing import Any, Callable, Literal
 
 from cerebras.cloud.sdk import Cerebras
@@ -14,8 +15,10 @@ from utils import format_message_history
 
 # Timeout for LLM API calls in seconds
 LLM_TIMEOUT_SECONDS = 120.0
+OPENROUTER_CEREBRAS_PROVIDER_SLUG = "cerebras"
 
 LLM_PROVIDER_LOCKS: dict[str, asyncio.Lock] = {}
+logger = logging.getLogger(__name__)
 
 def _get_provider_lock(provider: str) -> asyncio.Lock:
     """
@@ -26,6 +29,106 @@ def _get_provider_lock(provider: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         LLM_PROVIDER_LOCKS[provider] = lock
     return lock
+
+
+def _is_rate_limit_error(error: Exception) -> bool:
+    """
+    Return True when an exception likely represents an HTTP 429 response.
+
+    Args:
+        error: Exception raised by an LLM client call.
+
+    Returns:
+        True when error metadata or message suggests rate limiting.
+    """
+    # Check common SDK status code attributes first for reliable detection
+    status_code = getattr(error, "status_code", None)
+    if status_code == 429:
+        return True
+
+    # Some SDKs attach HTTP details under a nested response object
+    response = getattr(error, "response", None)
+    nested_status_code = getattr(response, "status_code", None)
+    if nested_status_code == 429:
+        return True
+
+    # Fallback to message text matching for provider-specific exception formats
+    message = str(error).lower()
+    return "429" in message or "rate limit" in message or "too many requests" in message
+
+
+def _normalize_openrouter_model(model: str) -> str:
+    """
+    Normalize model name to a valid OpenRouter model ID.
+
+    Args:
+        model: Model identifier from runtime config.
+
+    Returns:
+        OpenRouter-compatible model ID.
+    """
+    # Keep explicit OpenRouter IDs untouched
+    if "/" in model:
+        return model
+
+    # Map common provider-native IDs to OpenRouter model IDs
+    if model == "gpt-oss-120b":
+        return "openai/gpt-oss-120b"
+
+    # Default to input value so unknown models still surface clear API errors
+    return model
+
+
+def _build_openrouter_request(
+    model: str,
+    messages: list[dict[str, Any]],
+    *,
+    prefer_cerebras_route: bool = False,
+) -> Any:
+    """
+    Execute an OpenRouter chat completion request.
+
+    Args:
+        model: Model identifier used for OpenRouter.
+        messages: Chat message payload for the completion API.
+        prefer_cerebras_route: Whether to prefer Cerebras in OpenRouter provider routing.
+
+    Returns:
+        OpenRouter chat completion response payload.
+    """
+    # Normalize model IDs so fallback calls use OpenRouter's expected format
+    normalized_model = _normalize_openrouter_model(model)
+
+    # Keep reasoning enabled to match current moderation behavior
+    extra_body: dict[str, Any] = {"reasoning": {"enabled": True}}
+    if prefer_cerebras_route:
+        # Use provider slug format from OpenRouter docs
+        extra_body["provider"] = {
+            "order": [OPENROUTER_CEREBRAS_PROVIDER_SLUG],
+            "allow_fallbacks": False,
+        }
+
+    request_kwargs = {
+        "model": normalized_model,
+        "messages": messages,  # type: ignore[arg-type]
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "candidate_features",
+                "strict": True,
+                "schema": CANDIDATE_FEATURES_SCHEMA
+            }
+        },
+        "max_tokens": 65536,
+        "extra_body": extra_body,
+    }
+    try:
+        return _get_openrouter_client().chat.completions.create(
+            **request_kwargs,
+            timeout=LLM_TIMEOUT_SECONDS,
+        )
+    except TypeError:
+        return _get_openrouter_client().chat.completions.create(**request_kwargs)
 
 async def _run_llm_call(provider: str, call: Callable[[], Any]) -> Any:
     """
@@ -308,6 +411,7 @@ async def extract_features_from_formatted_history(
         {"role": "user", "content": user_prompt}
     ]
 
+    effective_provider = provider
     try:
         if provider == "cerebras":
             # Run synchronous Cerebras API call in a thread pool with timeout
@@ -334,31 +438,33 @@ async def extract_features_from_formatted_history(
                 except TypeError:
                     return _get_cerebras_client().chat.completions.create(**request_kwargs)
 
-            response: Any = await _run_llm_call("cerebras", _cerebras_request)
+            try:
+                response: Any = await _run_llm_call("cerebras", _cerebras_request)
+            except Exception as cerebras_error:
+                # On 429, retry through OpenRouter while requesting Cerebras-first routing
+                if _is_rate_limit_error(cerebras_error) and OPENROUTER_API_KEY:
+                    logger.warning(
+                        "Cerebras rate limited feature extraction request; retrying via OpenRouter with Cerebras provider preference"
+                    )
+                    effective_provider = "openrouter"
+                    response = await _run_llm_call(
+                        "openrouter",
+                        lambda: _build_openrouter_request(
+                            model=model,
+                            messages=messages,
+                            prefer_cerebras_route=True,
+                        ),
+                    )
+                else:
+                    raise
         elif provider == "openrouter":
             # Run synchronous OpenRouter API call in a thread pool with timeout
             def _openrouter_request() -> Any:
-                request_kwargs = {
-                    "model": model,
-                    "messages": messages,  # type: ignore[arg-type]
-                    "response_format": {
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "candidate_features",
-                            "strict": True,
-                            "schema": CANDIDATE_FEATURES_SCHEMA
-                        }
-                    },
-                    "max_tokens": 65536,
-                    "extra_body": {"reasoning": {"enabled": True}},
-                }
-                try:
-                    return _get_openrouter_client().chat.completions.create(
-                        **request_kwargs,
-                        timeout=LLM_TIMEOUT_SECONDS,
-                    )
-                except TypeError:
-                    return _get_openrouter_client().chat.completions.create(**request_kwargs)
+                return _build_openrouter_request(
+                    model=model,
+                    messages=messages,
+                    prefer_cerebras_route=False,
+                )
 
             response = await _run_llm_call("openrouter", _openrouter_request)
         elif provider == "gemini":
@@ -388,23 +494,31 @@ async def extract_features_from_formatted_history(
         else:
             raise ValueError(f"Unknown provider: {provider}")
 
-        if provider in {"cerebras", "openrouter"}:
+        if effective_provider in {"cerebras", "openrouter"}:
             # Parse the structured JSON response with error handling
             if not response.choices:
-                raise ValueError(f"{provider} returned no choices in response")
+                raise ValueError(f"{effective_provider} returned no choices in response")
             content: str | None = response.choices[0].message.content
             if content is None:
-                raise ValueError(f"{provider} returned empty message content")
+                raise ValueError(f"{effective_provider} returned empty message content")
             try:
                 result: dict[str, Any] = json.loads(content)
                 candidates = result["candidates"]
             except json.JSONDecodeError as e:
-                raise ValueError(f"Failed to parse {provider} JSON response: {e}") from e
+                raise ValueError(f"Failed to parse {effective_provider} JSON response: {e}") from e
             except KeyError:
-                raise ValueError(f"{provider} response missing 'candidates' key")
+                raise ValueError(f"{effective_provider} response missing 'candidates' key")
 
     except asyncio.TimeoutError:
-        raise TimeoutError(f"LLM API call to {provider} timed out after {LLM_TIMEOUT_SECONDS}s")
+        # Report the provider that actually timed out, not just the original request provider
+        if effective_provider != provider:
+            raise TimeoutError(
+                f"LLM API call to {effective_provider} timed out after {LLM_TIMEOUT_SECONDS}s "
+                f"(initial provider: {provider})"
+            )
+        raise TimeoutError(
+            f"LLM API call to {effective_provider} timed out after {LLM_TIMEOUT_SECONDS}s"
+        )
 
     return _augment_stat_features(candidates)
 
@@ -450,6 +564,8 @@ async def get_candidate_features(
     rel_id_to_author = {idx + 1: msg.author.id for idx, msg in enumerate(message_history)}
     # Map between relative IDs (1-based) and actual Discord message IDs for later resolution
     rel_id_to_discord_id = {idx + 1: msg.id for idx, msg in enumerate(message_history)}
+    # Reverse lookup used to recover canonical relative indexes after resolution
+    discord_id_to_rel_id = {msg.id: idx + 1 for idx, msg in enumerate(message_history)}
     discord_id_lookup = {str(msg.id): msg.id for msg in message_history}
     username_id_map: dict[str, int] = {}
     for msg in message_history:
@@ -483,19 +599,37 @@ async def get_candidate_features(
             else None
         )
         
-        # Resolve the candidate's message_id (which may be relative or a Discord ID) to the real Discord message ID
+        # Resolve the candidate's message_id (which may be relative or a Discord ID)
+        # to the real Discord message ID and canonical relative index
         raw_message_id = candidate.get("message_id")
         discord_message_id = None
+        relative_message_index = None
         if isinstance(raw_message_id, str):
             if raw_message_id in discord_id_lookup:
                 discord_message_id = discord_id_lookup[raw_message_id]
+                relative_message_index = discord_id_to_rel_id.get(discord_message_id)
             elif raw_message_id.isdigit():
-                rel_val = int(raw_message_id)
-                discord_message_id = rel_id_to_discord_id.get(rel_val)
+                numeric_message_id = int(raw_message_id)
+                if numeric_message_id in rel_id_to_discord_id:
+                    # Prefer relative-index interpretation for short numeric IDs.
+                    discord_message_id = rel_id_to_discord_id.get(numeric_message_id)
+                    relative_message_index = numeric_message_id
+                elif numeric_message_id in discord_id_to_rel_id:
+                    # Fallback to Discord snowflake interpretation when the number
+                    # matches a known message ID from the current history window.
+                    discord_message_id = numeric_message_id
+                    relative_message_index = discord_id_to_rel_id.get(numeric_message_id)
         elif isinstance(raw_message_id, int):
-            discord_message_id = rel_id_to_discord_id.get(raw_message_id)
+            if raw_message_id in rel_id_to_discord_id:
+                discord_message_id = rel_id_to_discord_id.get(raw_message_id)
+                relative_message_index = raw_message_id
+            elif raw_message_id in discord_id_to_rel_id:
+                discord_message_id = raw_message_id
+                relative_message_index = discord_id_to_rel_id.get(raw_message_id)
 
         if discord_message_id is not None:
             candidate["discord_message_id"] = discord_message_id
+        if relative_message_index is not None:
+            candidate["relative_message_index"] = relative_message_index
 
     return candidates

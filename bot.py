@@ -585,12 +585,46 @@ class ExcelsiorBot(discord.Bot):
 
         # Filter out candidates that fall in the context-only prefix of the current
         # history window. This mirrors ignore_first_message_count above.
+        # Build a map once so we can recover relative indexes from Discord IDs.
+        discord_message_id_to_rel_index = {
+            message.id: index + 1 for index, message in enumerate(store_history_copy)
+        }
+
         def _safe_message_index(candidate: dict) -> int:
-            # Coerce message_id to int to tolerate string or missing values
-            try:
-                return int(candidate.get("message_id", 0))
-            except (TypeError, ValueError):
-                return 0
+            """
+            Resolve a candidate's relative message index in the current history window.
+
+            Returns:
+                1-based index when resolvable, otherwise 0.
+            """
+            # Prefer the canonical index produced during candidate resolution.
+            candidate_relative_index = candidate.get("relative_message_index")
+            if isinstance(candidate_relative_index, int):
+                return candidate_relative_index
+            if isinstance(candidate_relative_index, str) and candidate_relative_index.isdigit():
+                return int(candidate_relative_index)
+
+            # Fallback for older candidate payloads that only include message_id.
+            raw_message_id = candidate.get("message_id")
+            if isinstance(raw_message_id, int):
+                numeric_message_id = raw_message_id
+            elif isinstance(raw_message_id, str):
+                try:
+                    numeric_message_id = int(raw_message_id)
+                except ValueError:
+                    numeric_message_id = 0
+            else:
+                numeric_message_id = 0
+
+            if 1 <= numeric_message_id <= len(store_history_copy):
+                return numeric_message_id
+
+            # When message_id is a Discord snowflake, map it back to a relative index.
+            discord_message_id = candidate.get("discord_message_id")
+            if isinstance(discord_message_id, int):
+                return discord_message_id_to_rel_index.get(discord_message_id, 0)
+
+            return 0
 
         # Build a lookup of users who currently hold the waiver role
         # Behavior is configurable:
@@ -608,6 +642,7 @@ class ExcelsiorBot(discord.Bot):
         filtered_pairs: list[tuple[dict, discord.Message]] = []
         count_message_not_in_history = 0
         count_waiver = 0
+        count_waiver_targets_seen = 0
         count_too_close = 0
         for candidate in candidates:
             candidate_message = next(
@@ -619,10 +654,15 @@ class ExcelsiorBot(discord.Bot):
                 continue
 
             target_user_id = candidate.get("target_user_id")
+            is_waiver_target = (
+                isinstance(target_user_id, int)
+                and target_user_id in waiver_target_user_ids
+            )
+            if is_waiver_target:
+                count_waiver_targets_seen += 1
             if (
                 not SAVE_WAIVER_FILTERED_FLAGS
-                and isinstance(target_user_id, int)
-                and target_user_id in waiver_target_user_ids
+                and is_waiver_target
             ):
                 count_waiver += 1
                 continue
@@ -639,6 +679,14 @@ class ExcelsiorBot(discord.Bot):
             filter_counts["waiver"] = count_waiver
         if count_too_close > 0:
             filter_counts["too_close_to_beginning"] = count_too_close
+        if count_waiver_targets_seen > 0:
+            logger.info(
+                "Waiver-role impact for channel %s: %d candidate(s) target waived users, %d filtered pre-model (SAVE_WAIVER_FILTERED_FLAGS=%s)",
+                channel.id,
+                count_waiver_targets_seen,
+                count_waiver,
+                SAVE_WAIVER_FILTERED_FLAGS,
+            )
 
         if not filtered_pairs:
             filter_summary = ", ".join(f"{name}: {n}" for name, n in filter_counts.items())
@@ -716,6 +764,30 @@ class ExcelsiorBot(discord.Bot):
         )
 
         # Predict using a numpy feature matrix aligned to training order
+        model_n_features_in = getattr(getattr(classifier, "model", None), "n_features_in_", None)
+        if isinstance(model_n_features_in, int) and feature_matrix.shape[1] != model_n_features_in:
+            logger.error(
+                "Feature shape mismatch for channel %s: runtime has %d feature(s), model expects %d; skipping moderation pass",
+                channel.id,
+                feature_matrix.shape[1],
+                model_n_features_in,
+            )
+            result.reason = (
+                f"Feature shape mismatch: runtime={feature_matrix.shape[1]}, "
+                f"model={model_n_features_in}"
+            )
+            return result
+
+        label_classes = getattr(getattr(classifier, "label_encoder", None), "classes_", None)
+        if label_classes is not None:
+            class_names = [str(class_name) for class_name in label_classes]
+            logger.info("Loaded moderation classes for channel %s: %s", channel.id, class_names)
+            if "flag" not in class_names:
+                logger.warning(
+                    "Model classes for channel %s do not include 'flag'; runtime will only action explicit 'flag' predictions",
+                    channel.id,
+                )
+
         predictions = classifier.predict(feature_matrix)
         
         db_session = self.get_db_session()
