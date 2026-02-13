@@ -13,3 +13,4 @@ analysis_outputs/
 plan.md
 *.zip
 misc/
+venv/
