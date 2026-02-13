@@ -74,12 +74,14 @@ LightGBM classifier implementation with abstract base class pattern.
 - Concrete `LightGBMClassifier` implementation
 - Model serialization/deserialization with joblib
 - Balanced class weights for imbalanced data
+- Monotonic constraints profile support for semantically aligned training behavior
 
 **Model Parameters**:
 - 200 estimators
 - Max depth: 6
 - Learning rate: 0.1
 - Binary or multi-class objective
+- Optional monotone constraints aligned to feature order
 
 ### 4. Training Module (`training.py`)
 
@@ -161,6 +163,9 @@ familiarity_score_stat = co_occurrence_count / (co_occurrence_count + 10)
 - `/retrain` for forced model retraining (admin role only)
 - `/mod_flag_analytics` for guild-scoped flagged-count analytics (default: last 1 day)
 - `/mod_flag_leaderboard` for top flagged members (default: last 30 days)
+- `/mod_flag_recent` for newest flagged rows with jump links
+- `/mod_flag_investigate` for interactive flagged-message inspection
+- `/mod_flag_drilldown` for direct message-ID investigation view
 - Moderator and admin permission checks
 
 **`cogs/public.py`**: Public utility commands
@@ -247,15 +252,16 @@ New model used on next moderation run
 
 **Process**:
 1. Each tracked channel/thread gets a `ChannelModerationState` with counters and timers
-2. `on_message` event increments `messages_since_check` and starts idle timer
+2. `on_message` increments `messages_since_check`; idle timer starts only after `NEW_MESSAGES_BEFORE_TIMER_START` messages accumulate
 3. `_moderation_scheduler` runs in background for each channel:
    - Waits for either `MESSAGES_PER_CHECK` messages or `SECS_BETWEEN_AUTO_CHECKS` seconds
    - Triggers `moderate_channel()` when threshold met
    - Resets counters after successful moderation
+   - Applies exponential failure cooldown (`MODERATION_FAILURE_BACKOFF_BASE` to `MODERATION_FAILURE_BACKOFF_MAX`) when runs fail
 
 **Trigger Conditions**:
 - **Message count**: After N new messages since last check
-- **Idle timer**: After M seconds of inactivity with new unchecked messages
+- **Idle timer**: After M seconds of inactivity, once minimum pending-message threshold is met
 - **Manual**: Via `/check` command
 
 ### 2. Message Flagging Logic
@@ -296,7 +302,7 @@ New model used on next moderation run
    - Build feature matrix X with 18 features
    - Build label vector y with rating categories
    - Apply category collapsing if enabled
-4. Train LightGBM classifier with balanced class weights
+4. Train LightGBM classifier with balanced class weights and semantic monotonic constraints
 5. Save model to `models/lightgbm_model.joblib`
 6. Model is immediately used by bot (loaded on next moderation run)
 
@@ -401,7 +407,7 @@ Computed from database statistics:
 1. Format message history as numbered list with author names and content
 2. Send to LLM with structured JSON schema
 3. LLM identifies candidate messages by relative ID and extracts features
-4. Look up author IDs from message history
+4. Resolve candidate message IDs to canonical Discord message IDs (supports relative IDs and in-window snowflake IDs)
 5. Query database for seniority and familiarity statistics
 6. Compute normalized stat features
 7. Return combined 18-feature vectors
@@ -568,6 +574,9 @@ ADMIN_ROLE                # Single admin role used for `/retrain` authorization
 MESSAGES_PER_CHECK        # Messages before auto-check (default: 30)
 HISTORY_PER_CHECK         # Messages of history sent to LLM (default: 40)
 SECS_BETWEEN_AUTO_CHECKS  # Idle timeout before auto-check (default: 240 seconds = 4 minutes)
+NEW_MESSAGES_BEFORE_TIMER_START  # New messages required before idle timer begins (default: 3)
+MODERATION_FAILURE_BACKOFF_BASE  # Base cooldown after failed moderation run (default: 30)
+MODERATION_FAILURE_BACKOFF_MAX   # Max cooldown after repeated failures (default: 600)
 REACTION_EMOJI            # Emoji added to flagged messages (default: 👁️)
 SAVE_WAIVER_FILTERED_FLAGS # Keep waived-target rows in DB while suppressing Discord action
 ```
@@ -779,6 +788,9 @@ The bot will:
    ```
    /mod_flag_analytics days:1
    /mod_flag_leaderboard days:30 include_waiver_filtered:true include_all_flagged_messages:true
+   /mod_flag_recent count:10 include_waiver_filtered:true
+   /mod_flag_investigate count:10 include_waiver_filtered:true
+   /mod_flag_drilldown message_id:<flagged_message_id>
    ```
 4. **Test rating system**:
    - Go to rating channel
@@ -1269,6 +1281,21 @@ GROUP BY category;
    ```
 3. Enable debug logging and run `/retrain`
 
+### Model fails to load at runtime
+
+**Possible causes**:
+1. **Missing LightGBM runtime dependency**: Commonly `libgomp.so.1` on Linux hosts
+2. **Corrupted or incompatible model artifact**: `lightgbm_model.joblib` cannot be deserialized cleanly
+3. **Environment drift**: Runtime dependencies differ from training environment
+
+**Solutions**:
+1. **Install missing runtime libraries**: For `libgomp.so.1`, install `libgomp1` and restart the process
+2. **Regenerate model file**: Retrain and save a fresh artifact in `models/lightgbm_model.joblib`
+3. **Verify dependencies**: Ensure LightGBM and Python package versions are present on host
+
+**Behavior note**:
+- Runtime now catches model load failures via `ModelLoadError`, logs an actionable reason, and safely skips that moderation pass instead of crashing scheduler loops
+
 ### LLM extraction errors
 
 **Possible causes**:
@@ -1332,5 +1359,5 @@ For issues or questions:
 
 ---
 
-**Document Version**: 1.1  
-**Last Updated**: 2026-02-10
+**Document Version**: 1.2  
+**Last Updated**: 2026-02-12
