@@ -33,6 +33,7 @@ class ModFlagRecordSelect(discord.ui.Select):
             min_values=1,
             max_values=1,
             options=options,
+            row=0,
         )
 
     def _build_options(self) -> list[discord.SelectOption]:
@@ -687,6 +688,7 @@ class ModFlagInvestigationView(discord.ui.View):
         label="Open Selected",
         style=discord.ButtonStyle.primary,
         custom_id="mod_flag_open_selected",
+        row=2,
     )
     async def open_selected_button(
         self,
@@ -703,6 +705,7 @@ class ModFlagInvestigationView(discord.ui.View):
         label="Features",
         style=discord.ButtonStyle.secondary,
         custom_id="mod_flag_features",
+        row=2,
     )
     async def features_button(
         self,
@@ -719,6 +722,7 @@ class ModFlagInvestigationView(discord.ui.View):
         label="History",
         style=discord.ButtonStyle.secondary,
         custom_id="mod_flag_history",
+        row=2,
     )
     async def history_button(
         self,
@@ -737,6 +741,7 @@ class ModFlagInvestigationView(discord.ui.View):
         label="History Newer",
         style=discord.ButtonStyle.secondary,
         custom_id="mod_flag_history_newer",
+        row=3,
     )
     async def history_newer_button(
         self,
@@ -769,6 +774,7 @@ class ModFlagInvestigationView(discord.ui.View):
         label="History Older",
         style=discord.ButtonStyle.secondary,
         custom_id="mod_flag_history_older",
+        row=3,
     )
     async def history_older_button(
         self,
@@ -813,6 +819,7 @@ class ModFlagInvestigationView(discord.ui.View):
         label="Back to List",
         style=discord.ButtonStyle.gray,
         custom_id="mod_flag_back_to_list",
+        row=3,
     )
     async def back_to_list_button(
         self,
