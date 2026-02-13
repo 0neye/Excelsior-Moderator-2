@@ -301,7 +301,7 @@ class ModFlagInvestigationView(discord.ui.View):
         context_messages: list[dict[str, Any]],
     ) -> list[tuple[int, dict[str, Any]]]:
         """
-        Return context rows for the active page, newest-to-oldest.
+        Return context rows for the active page in chronological order.
 
         Args:
             context_messages: Full stored context list in chronological order
@@ -313,12 +313,12 @@ class ModFlagInvestigationView(discord.ui.View):
         if total_count == 0:
             return []
 
-        # Convert the current page into offsets from the newest message
-        start_offset = self.history_page_index * self.HISTORY_PAGE_SIZE
-        end_offset = min(start_offset + self.HISTORY_PAGE_SIZE, total_count)
+        # Keep page 1 aligned with the oldest stored context rows for intuitive reading
+        start_index = self.history_page_index * self.HISTORY_PAGE_SIZE
+        end_index = min(start_index + self.HISTORY_PAGE_SIZE, total_count)
         return [
-            (total_count - 1 - reverse_offset, context_messages[total_count - 1 - reverse_offset])
-            for reverse_offset in range(start_offset, end_offset)
+            (absolute_index, context_messages[absolute_index])
+            for absolute_index in range(start_index, end_index)
         ]
 
     def _split_for_detail_fields(self, raw_text: str) -> tuple[list[str], bool]:
@@ -756,14 +756,27 @@ class ModFlagInvestigationView(discord.ui.View):
             )
             return
 
-        if self.history_page_index <= 0:
+        payload = self.cog._get_flagged_message_debug_payload(
+            guild_id=self.guild_id,
+            message_id=self.selected_message_id,
+        )
+        if payload is None:
+            await interaction.response.send_message(
+                "That flagged message could not be found in this server.",
+                ephemeral=True,
+            )
+            return
+
+        total_pages = self._get_history_total_pages(len(payload["context_messages"]))
+        if self.history_page_index >= total_pages - 1:
             await interaction.response.send_message(
                 "You are already on the newest history page.",
                 ephemeral=True,
             )
             return
 
-        self.history_page_index -= 1
+        # Newer pages are higher index values when page 1 starts at oldest rows
+        self.history_page_index += 1
         self.selected_context_index = None
         self.mode = "history"
         self._sync_button_states()
@@ -800,15 +813,15 @@ class ModFlagInvestigationView(discord.ui.View):
             )
             return
 
-        total_pages = self._get_history_total_pages(len(payload["context_messages"]))
-        if self.history_page_index >= total_pages - 1:
+        if self.history_page_index <= 0:
             await interaction.response.send_message(
                 "You are already on the oldest history page.",
                 ephemeral=True,
             )
             return
 
-        self.history_page_index += 1
+        # Older pages are lower index values when page 1 starts at oldest rows
+        self.history_page_index -= 1
         self.selected_context_index = None
         self.mode = "history"
         self._sync_button_states()
