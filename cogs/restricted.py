@@ -1081,7 +1081,7 @@ class Restricted(commands.Cog):
         include_waiver_filtered: bool,
         include_all_flagged_messages: bool,
         limit: int = 10,
-    ) -> list[tuple[int, int]]:
+    ) -> tuple[list[tuple[int, int]], int]:
         """
         Build a leaderboard of authors with the most flagged messages.
 
@@ -1093,7 +1093,9 @@ class Restricted(commands.Cog):
             limit: Maximum number of leaderboard rows to return
 
         Returns:
-            List of (author_id, flagged_count) sorted by count descending
+            Tuple of (leaderboard_rows, total_filtered_flagged_count) where:
+            - leaderboard_rows is a list of (author_id, flagged_count) sorted by count descending
+            - total_filtered_flagged_count is the total number of flagged messages after filters
         """
         session = self.get_db_session()
         try:
@@ -1128,6 +1130,9 @@ class Restricted(commands.Cog):
                     )
                 )
 
+            # Capture the full filtered denominator for percentage rendering in the command output
+            total_filtered_flagged_count = flagged_query.count()
+
             # Aggregate by author to rank the members most frequently flagged
             leaderboard_rows = (
                 flagged_query.with_entities(
@@ -1142,7 +1147,10 @@ class Restricted(commands.Cog):
         finally:
             session.close()
 
-        return [(author_id, flagged_count) for author_id, flagged_count in leaderboard_rows]
+        return (
+            [(author_id, flagged_count) for author_id, flagged_count in leaderboard_rows],
+            total_filtered_flagged_count,
+        )
 
     def _get_recent_flagged_messages(
         self,
@@ -1313,7 +1321,7 @@ class Restricted(commands.Cog):
             return
 
         # Pull a wider pool first, then keep the top ten current guild members
-        leaderboard_rows = self._get_flagged_author_leaderboard(
+        leaderboard_rows, total_filtered_flagged_count = self._get_flagged_author_leaderboard(
             guild_id=ctx.guild.id,
             days=days,
             include_waiver_filtered=include_waiver_filtered,
@@ -1344,7 +1352,10 @@ class Restricted(commands.Cog):
 
         # Render a compact top-10 leaderboard with mentions for easy moderation follow-up
         leaderboard_lines = [
-            f"{rank}. <@{author_id}> - {flagged_count} flagged"
+            (
+                f"{rank}. <@{author_id}> - {flagged_count} flagged "
+                f"({(flagged_count / total_filtered_flagged_count) * 100:.1f}%)"
+            )
             for rank, (author_id, flagged_count) in enumerate(top_member_rows, start=1)
         ]
 
