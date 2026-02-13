@@ -27,7 +27,12 @@ from database import (
     MessageFeatures,
 )
 from db_config import get_session, init_db
-from ml import FEATURE_NAMES, create_classifier
+from ml import (
+    FEATURE_NAMES,
+    MONOTONIC_PROFILE_SEMANTIC_EXTENDED,
+    build_monotone_constraints,
+    create_classifier,
+)
 
 logger = get_logger(__name__)
 
@@ -367,8 +372,16 @@ async def retrain_model(
 
         logger.info("Training with %d samples...", len(y_train))
 
+        # Apply the semantic_extended monotonic profile to stabilize decision boundaries
+        monotone_constraints = build_monotone_constraints(
+            feature_names, MONOTONIC_PROFILE_SEMANTIC_EXTENDED
+        )
+
         # Create and train classifier
-        model = create_classifier("lightgbm")
+        model = create_classifier(
+            "lightgbm",
+            monotone_constraints=monotone_constraints,
+        )
         model.feature_names = feature_names
         model.fit(X_train, y_train)
 

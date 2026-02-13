@@ -33,6 +33,37 @@ FEATURE_NAMES = [
     "familiarity_score_stat",
 ]
 
+# Monotonic profile used in production training:
+# +1 means larger value should push toward class index 1 ("no-flag" in binary mode)
+# -1 means larger value should push toward class index 0 ("flag" in binary mode)
+MONOTONIC_PROFILE_SEMANTIC_EXTENDED: dict[str, int] = {
+    "positive_framing_score": 1,
+    "includes_positive_takeaways": 1,
+    "tone_harshness_score": -1,
+    "target_uncomfortableness_score": -1,
+    "explains_why_score": 1,
+    "actionable_suggestion_score": 1,
+    "context_is_feedback_appropriate": 1,
+    "reciprocity_score": 1,
+    "solicited_score": 1,
+}
+
+
+def build_monotone_constraints(
+    feature_names: list[str], feature_constraints: dict[str, int]
+) -> list[int]:
+    """
+    Build a monotone constraint vector aligned to model feature order.
+
+    Args:
+        feature_names: Ordered feature names used during training
+        feature_constraints: Per-feature monotonic constraints (-1, 0, +1)
+
+    Returns:
+        Constraint vector aligned with feature_names
+    """
+    return [int(feature_constraints.get(feature_name, 0)) for feature_name in feature_names]
+
 
 class ModelLoadError(RuntimeError):
     """Raised when the persisted classifier cannot be loaded in this runtime."""
@@ -158,6 +189,7 @@ class LightGBMClassifier(ModerationClassifier):
         num_leaves: int = 50,
         class_weight: str | dict | None = "balanced",
         random_state: int = 42,
+        monotone_constraints: list[int] | tuple[int, ...] | None = None,
     ):
         """
         Initialize LightGBM classifier.
@@ -169,6 +201,7 @@ class LightGBMClassifier(ModerationClassifier):
             num_leaves: Maximum number of leaves in one tree
             class_weight: Weights for classes ('balanced' or dict)
             random_state: Random seed for reproducibility
+            monotone_constraints: Optional monotonicity constraints in feature order
         """
         super().__init__()
         self.n_estimators = n_estimators
@@ -177,6 +210,7 @@ class LightGBMClassifier(ModerationClassifier):
         self.num_leaves = num_leaves
         self.class_weight = class_weight
         self.random_state = random_state
+        self.monotone_constraints = monotone_constraints
         self.model = None
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
@@ -200,6 +234,7 @@ class LightGBMClassifier(ModerationClassifier):
             class_weight=self.class_weight,
             random_state=self.random_state,
             objective="multiclass" if n_classes > 2 else "binary",
+            monotone_constraints=self.monotone_constraints,
             verbose=-1,
         )
 
@@ -232,6 +267,7 @@ class LightGBMClassifier(ModerationClassifier):
             "num_leaves": self.num_leaves,
             "class_weight": self.class_weight,
             "random_state": self.random_state,
+            "monotone_constraints": self.monotone_constraints,
         }
 
     def _set_model_data(self, data: dict[str, Any]) -> None:
@@ -243,6 +279,7 @@ class LightGBMClassifier(ModerationClassifier):
         self.num_leaves = data["num_leaves"]
         self.class_weight = data["class_weight"]
         self.random_state = data["random_state"]
+        self.monotone_constraints = data.get("monotone_constraints")
 
     def get_feature_importance(self) -> dict[str, float]:
         """Get native LightGBM feature importance."""

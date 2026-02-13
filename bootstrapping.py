@@ -38,7 +38,13 @@ from database import (
 )
 from db_config import get_session, init_db
 from llms import extract_features_from_formatted_history
-from ml import FEATURE_NAMES, ModerationClassifier, create_classifier
+from ml import (
+    FEATURE_NAMES,
+    MONOTONIC_PROFILE_SEMANTIC_EXTENDED,
+    ModerationClassifier,
+    build_monotone_constraints,
+    create_classifier,
+)
 from user_stats import (
     bootstrap_user_stats,
     build_author_id_map,
@@ -1556,7 +1562,17 @@ def train_model(
         len(feature_names or FEATURE_NAMES),
     )
     
-    model = create_classifier("lightgbm")
+    resolved_feature_names = feature_names or FEATURE_NAMES
+
+    # Keep bootstrapping behavior aligned with production retraining constraints
+    monotone_constraints = build_monotone_constraints(
+        resolved_feature_names, MONOTONIC_PROFILE_SEMANTIC_EXTENDED
+    )
+
+    model = create_classifier(
+        "lightgbm",
+        monotone_constraints=monotone_constraints,
+    )
     # Attach active feature names for downstream importance reporting
     if feature_names:
         model.feature_names = feature_names  # type: ignore[attr-defined]
