@@ -362,6 +362,7 @@ async def extract_features_from_formatted_history(
     ### Process:
     1. Identify all messages that could be considered providing feedback or criticism to another user present in the conversation.
     2. Determine the target of each candidate message. Who is the message criticizing? The target must be a user present in the conversation.
+       When determining the target, use timestamps to understand message composition timing: if a user appears to split one thought across multiple short consecutive messages, treat those messages as part of the same statement even if other users interleave messages between them.
     3. For each candidate message, provide a list of float values between 0 and 1 based on the features mentioned below.
     4. Output a JSON object matching the provided schema with all candidates and their features.
 

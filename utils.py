@@ -191,8 +191,8 @@ def format_discord_message(
     """
     timestamp = ""
     if include_timestamp:
-        # Format timestamp as YYYY-MM-DD HH:MM:SS
-        formatted_time = message.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        # Format timestamp as time-only to keep conversational sequencing context
+        formatted_time = message.created_at.strftime("%H:%M:%S")
         timestamp = f"[{formatted_time}] "
     
     rel_id = f"({relative_id}) " if relative_id is not None else ""
