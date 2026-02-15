@@ -468,8 +468,16 @@ class ExcelsiorBot(discord.Bot):
         Returns:
             The log-channel message ID when a post is created, otherwise None.
         """
-        # Add reaction to the original message
-        await message.add_reaction(REACTION_EMOJI)
+        # Try to react on the original message but continue if the author blocks the bot
+        try:
+            await message.add_reaction(REACTION_EMOJI)
+        except discord.HTTPException as error:
+            logger.warning(
+                "Unable to add moderation reaction to flagged message %s in channel %s: %s",
+                message.id,
+                getattr(message.channel, "id", "unknown"),
+                error,
+            )
 
         # Post to log channel for mod rating
         log_channel = self.get_channel(LOG_CHANNEL_ID)
@@ -512,10 +520,19 @@ class ExcelsiorBot(discord.Bot):
             log_message.id,
         )
 
-        # Add rating reaction emojis
+        # Add rating reaction emojis without aborting if one reaction fails
         rating_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
         for emoji in rating_emojis:
-            await log_message.add_reaction(emoji)
+            try:
+                await log_message.add_reaction(emoji)
+            except discord.HTTPException as error:
+                logger.warning(
+                    "Unable to add rating reaction %s to log message %s for flagged message %s: %s",
+                    emoji,
+                    log_message.id,
+                    message.id,
+                    error,
+                )
 
         return log_message.id
 
