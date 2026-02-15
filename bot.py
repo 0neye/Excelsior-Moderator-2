@@ -458,12 +458,19 @@ class ExcelsiorBot(discord.Bot):
                 self._ensure_scheduler_task(channel)
     
 
-    async def flag_message(self, message: discord.Message) -> int | None:
+    async def flag_message(
+        self,
+        message: discord.Message,
+        target_user_id: int | None = None,
+        target_username: str | None = None,
+    ) -> int | None:
         """
         Flag a message in Discord and return the created log-channel message ID.
 
         Args:
             message: The Discord message to flag.
+            target_user_id: Optional Discord user ID for the message target.
+            target_username: Optional username fallback for the message target.
         
         Returns:
             The log-channel message ID when a post is created, otherwise None.
@@ -491,6 +498,12 @@ class ExcelsiorBot(discord.Bot):
 
         # Build the log message content
         author_name = message.author.display_name or message.author.name
+        # Prefer a clickable user mention when we have a target user ID
+        target_display = (
+            f"<@{target_user_id}>"
+            if isinstance(target_user_id, int)
+            else (target_username or "Unknown / None")
+        )
         jump_url = message.jump_url
         content_preview = (message.content or "")[:500]
         if len(message.content or "") > 500:
@@ -499,6 +512,7 @@ class ExcelsiorBot(discord.Bot):
         log_content = (
             f"**Flagged Message**\n"
             f"**Author:** {author_name}\n"
+            f"**Target:** {target_display}\n"
             f"**Link:** {jump_url}\n"
             f"**Content:**\n```\n{content_preview}\n```\n"
             f"React with: 1️⃣ No Flag | 2️⃣ Ambiguous | 3️⃣ Unconstructive | 4️⃣ Unsolicited | 5️⃣ N/A"
@@ -910,7 +924,15 @@ class ExcelsiorBot(discord.Bot):
                                 channel.id,
                             )
                         else:
-                            log_message_id = await self.flag_message(candidate_message)
+                            log_message_id = await self.flag_message(
+                                candidate_message,
+                                target_user_id=target_user_id if isinstance(target_user_id, int) else None,
+                                target_username=(
+                                    candidate.get("target_username")
+                                    if isinstance(candidate.get("target_username"), str)
+                                    else None
+                                ),
+                            )
                             if log_message_id is not None:
                                 log_posts_to_add.append(
                                     LogChannelRatingPost(
