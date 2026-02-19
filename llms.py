@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Callable, Literal
 
 from cerebras.cloud.sdk import Cerebras
@@ -19,6 +20,95 @@ OPENROUTER_CEREBRAS_PROVIDER_SLUG = "cerebras"
 
 LLM_PROVIDER_LOCKS: dict[str, asyncio.Lock] = {}
 logger = logging.getLogger(__name__)
+
+
+def _normalize_username_key(raw_username: str) -> str:
+    """
+    Normalize a username/display-name key for stable lookups.
+
+    Args:
+        raw_username: Username-like value to normalize
+
+    Returns:
+        Normalized key with surrounding whitespace removed and case folded
+    """
+    return raw_username.strip().casefold()
+
+
+def _build_normalized_username_id_map(username_id_map: dict[str, int]) -> dict[str, int]:
+    """
+    Build normalized username lookup variants from a raw username map.
+
+    Args:
+        username_id_map: Exact username/display-name to user ID mappings
+
+    Returns:
+        Dict mapping normalized keys to user IDs
+    """
+    normalized_map: dict[str, int] = {}
+    for raw_username, user_id in username_id_map.items():
+        normalized_username = _normalize_username_key(raw_username)
+        if not normalized_username:
+            continue
+        normalized_map.setdefault(normalized_username, user_id)
+
+        # Include a no-@ variant so '@name' and 'name' resolve identically
+        if normalized_username.startswith("@"):
+            normalized_map.setdefault(normalized_username[1:].strip(), user_id)
+    return normalized_map
+
+
+def _resolve_target_user_id(
+    target_username: Any,
+    username_id_map: dict[str, int],
+    normalized_username_id_map: dict[str, int],
+    participant_user_ids: set[int],
+) -> int | None:
+    """
+    Resolve a candidate target username into a Discord user ID when possible.
+
+    Args:
+        target_username: Raw target identifier returned by the LLM
+        username_id_map: Exact username/display-name to user ID mappings
+        normalized_username_id_map: Normalized lookup map for tolerant matching
+        participant_user_ids: User IDs present in the current message history window
+
+    Returns:
+        Resolved Discord user ID, or None when no participant match is found
+    """
+    if not isinstance(target_username, str):
+        return None
+
+    cleaned_target_username = target_username.strip()
+    if not cleaned_target_username:
+        return None
+
+    # Handle explicit non-target sentinels used in prompts or model responses
+    if _normalize_username_key(cleaned_target_username) in {"nobody", "none", "unknown"}:
+        return None
+
+    # Resolve direct Discord mention forms like <@123> or <@!123>
+    mention_match = re.fullmatch(r"<@!?(\d+)>", cleaned_target_username)
+    if mention_match:
+        mentioned_user_id = int(mention_match.group(1))
+        if mentioned_user_id in participant_user_ids:
+            return mentioned_user_id
+        return None
+
+    # Prefer exact map lookups first to preserve existing behavior
+    exact_match_user_id = username_id_map.get(cleaned_target_username)
+    if isinstance(exact_match_user_id, int):
+        return exact_match_user_id
+
+    normalized_target_username = _normalize_username_key(cleaned_target_username)
+    resolved_user_id = normalized_username_id_map.get(normalized_target_username)
+    if isinstance(resolved_user_id, int):
+        return resolved_user_id
+
+    if normalized_target_username.startswith("@"):
+        return normalized_username_id_map.get(normalized_target_username[1:].strip())
+
+    return None
 
 def _get_provider_lock(provider: str) -> asyncio.Lock:
     """
@@ -307,6 +397,10 @@ async def extract_features_from_formatted_history(
                 candidate["features"] = features
             return candidates
 
+        resolved_username_id_map = username_id_map or {}
+        normalized_username_id_map = _build_normalized_username_id_map(resolved_username_id_map)
+        participant_user_ids = set(resolved_username_id_map.values())
+
         session = stats_session_factory()
         try:
             for candidate in candidates:
@@ -318,10 +412,11 @@ async def extract_features_from_formatted_history(
                 message_id = candidate.get("message_id")
                 target_username = candidate.get("target_username")
                 author_id = author_id_map.get(str(message_id)) if message_id is not None else None
-                target_id = (
-                    username_id_map.get(target_username)
-                    if username_id_map and isinstance(target_username, str)
-                    else None
+                target_id = _resolve_target_user_id(
+                    target_username=target_username,
+                    username_id_map=resolved_username_id_map,
+                    normalized_username_id_map=normalized_username_id_map,
+                    participant_user_ids=participant_user_ids,
                 )
 
                 if author_id is not None and target_id is not None:
@@ -572,6 +667,8 @@ async def get_candidate_features(
     for msg in message_history:
         username_id_map.setdefault(msg.author.name, msg.author.id)
         username_id_map.setdefault(msg.author.display_name, msg.author.id)
+    normalized_username_id_map = _build_normalized_username_id_map(username_id_map)
+    participant_user_ids = {msg.author.id for msg in message_history}
 
     # Ensure channel_name is not None
     if channel_name is None:
@@ -594,10 +691,11 @@ async def get_candidate_features(
     # Also attach the specific Discord message ID for each candidate
     for candidate in candidates:
         target_username = candidate.get("target_username")
-        candidate["target_user_id"] = (
-            username_id_map.get(target_username)
-            if isinstance(target_username, str)
-            else None
+        candidate["target_user_id"] = _resolve_target_user_id(
+            target_username=target_username,
+            username_id_map=username_id_map,
+            normalized_username_id_map=normalized_username_id_map,
+            participant_user_ids=participant_user_ids,
         )
         
         # Resolve the candidate's message_id (which may be relative or a Discord ID)

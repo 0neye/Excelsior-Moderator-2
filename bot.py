@@ -657,6 +657,22 @@ class ExcelsiorBot(discord.Bot):
 
             return 0
 
+        def _is_self_referential_candidate(candidate: dict, candidate_message: discord.Message) -> bool:
+            """
+            Detect candidates where criticism is directed at the candidate's own author.
+
+            Args:
+                candidate: Candidate payload produced by the LLM feature extractor
+                candidate_message: Discord message resolved for this candidate
+
+            Returns:
+                True when the candidate appears self-referential and should be filtered
+            """
+            target_user_id = candidate.get("target_user_id")
+            if not isinstance(target_user_id, int):
+                return False
+            return target_user_id == candidate_message.author.id
+
         # Build a lookup of users who currently hold the waiver role
         # Behavior is configurable:
         # - SAVE_WAIVER_FILTERED_FLAGS=True: keep waived flags in DB, suppress Discord action
@@ -672,6 +688,7 @@ class ExcelsiorBot(discord.Bot):
         # Keep candidate/message pairs aligned through all downstream filtering.
         filtered_pairs: list[tuple[dict, discord.Message]] = []
         count_message_not_in_history = 0
+        count_self_referential = 0
         count_waiver = 0
         count_waiver_targets_seen = 0
         count_too_close = 0
@@ -682,6 +699,10 @@ class ExcelsiorBot(discord.Bot):
             )
             if candidate_message is None:
                 count_message_not_in_history += 1
+                continue
+
+            if _is_self_referential_candidate(candidate, candidate_message):
+                count_self_referential += 1
                 continue
 
             target_user_id = candidate.get("target_user_id")
@@ -706,6 +727,8 @@ class ExcelsiorBot(discord.Bot):
 
         if count_message_not_in_history > 0:
             filter_counts["message_not_in_history"] = count_message_not_in_history
+        if count_self_referential > 0:
+            filter_counts["self_referential"] = count_self_referential
         if count_waiver > 0:
             filter_counts["waiver"] = count_waiver
         if count_too_close > 0:
