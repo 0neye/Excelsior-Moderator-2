@@ -106,6 +106,10 @@ REACTION_EMOJI = "👁️"
 
 DEFAULT_LLM_PROVIDER = "cerebras"
 DEFAULT_LLM_MODEL = "gpt-oss-120b"
+# Which Discord name field to expose to the LLM and expect back for target resolution
+# - "username": Uses Discord global usernames (author.name)
+# - "display_name": Uses guild display names (author.display_name)
+LLM_DISCORD_NAME_FIELD = "username"
 
 
 # Logging config

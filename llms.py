@@ -1,14 +1,18 @@
 import asyncio
 import json
 import logging
-import re
 from typing import Any, Callable, Literal
 
 from cerebras.cloud.sdk import Cerebras
 from google import genai
 from openai import OpenAI
 
-from config import CEREBRAS_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY
+from config import (
+    CEREBRAS_API_KEY,
+    GEMINI_API_KEY,
+    LLM_DISCORD_NAME_FIELD,
+    OPENROUTER_API_KEY,
+)
 from db_config import get_session
 from history import MessageStore
 from user_stats import get_familiarity_score_stat, get_seniority_scores
@@ -51,18 +55,32 @@ def _build_normalized_username_id_map(username_id_map: dict[str, int]) -> dict[s
         if not normalized_username:
             continue
         normalized_map.setdefault(normalized_username, user_id)
-
-        # Include a no-@ variant so '@name' and 'name' resolve identically
-        if normalized_username.startswith("@"):
-            normalized_map.setdefault(normalized_username[1:].strip(), user_id)
     return normalized_map
+
+
+def _should_use_username_for_llm() -> bool:
+    """
+    Return whether LLM message formatting should use Discord usernames.
+
+    Returns:
+        True when LLM_DISCORD_NAME_FIELD is configured as "username"
+    """
+    normalized_name_field = LLM_DISCORD_NAME_FIELD.strip().casefold()
+    if normalized_name_field in {"username", "display_name"}:
+        return normalized_name_field == "username"
+
+    # Fall back to username mode when config is invalid to preserve existing behavior
+    logger.warning(
+        "Invalid LLM_DISCORD_NAME_FIELD '%s'; defaulting to 'username'",
+        LLM_DISCORD_NAME_FIELD,
+    )
+    return True
 
 
 def _resolve_target_user_id(
     target_username: Any,
     username_id_map: dict[str, int],
     normalized_username_id_map: dict[str, int],
-    participant_user_ids: set[int],
 ) -> int | None:
     """
     Resolve a candidate target username into a Discord user ID when possible.
@@ -71,7 +89,6 @@ def _resolve_target_user_id(
         target_username: Raw target identifier returned by the LLM
         username_id_map: Exact username/display-name to user ID mappings
         normalized_username_id_map: Normalized lookup map for tolerant matching
-        participant_user_ids: User IDs present in the current message history window
 
     Returns:
         Resolved Discord user ID, or None when no participant match is found
@@ -87,14 +104,6 @@ def _resolve_target_user_id(
     if _normalize_username_key(cleaned_target_username) in {"nobody", "none", "unknown"}:
         return None
 
-    # Resolve direct Discord mention forms like <@123> or <@!123>
-    mention_match = re.fullmatch(r"<@!?(\d+)>", cleaned_target_username)
-    if mention_match:
-        mentioned_user_id = int(mention_match.group(1))
-        if mentioned_user_id in participant_user_ids:
-            return mentioned_user_id
-        return None
-
     # Prefer exact map lookups first to preserve existing behavior
     exact_match_user_id = username_id_map.get(cleaned_target_username)
     if isinstance(exact_match_user_id, int):
@@ -104,9 +113,6 @@ def _resolve_target_user_id(
     resolved_user_id = normalized_username_id_map.get(normalized_target_username)
     if isinstance(resolved_user_id, int):
         return resolved_user_id
-
-    if normalized_target_username.startswith("@"):
-        return normalized_username_id_map.get(normalized_target_username[1:].strip())
 
     return None
 
@@ -399,8 +405,6 @@ async def extract_features_from_formatted_history(
 
         resolved_username_id_map = username_id_map or {}
         normalized_username_id_map = _build_normalized_username_id_map(resolved_username_id_map)
-        participant_user_ids = set(resolved_username_id_map.values())
-
         session = stats_session_factory()
         try:
             for candidate in candidates:
@@ -416,7 +420,6 @@ async def extract_features_from_formatted_history(
                     target_username=target_username,
                     username_id_map=resolved_username_id_map,
                     normalized_username_id_map=normalized_username_id_map,
-                    participant_user_ids=participant_user_ids,
                 )
 
                 if author_id is not None and target_id is not None:
@@ -652,7 +655,12 @@ async def get_candidate_features(
     thread_name = channel_info.channel_name if channel_info.is_thread else None
 
     message_history = message_store.get_whole_history(channel_id)
-    formatted_message_history_list = format_message_history(message_history, use_username=True, include_timestamp=True)
+    use_username_for_llm = _should_use_username_for_llm()
+    formatted_message_history_list = format_message_history(
+        message_history,
+        use_username=use_username_for_llm,
+        include_timestamp=True,
+    )
     formatted_message_history = "\n".join(formatted_message_history_list)
 
     # Build author/username maps for stat-driven features
@@ -665,10 +673,10 @@ async def get_candidate_features(
     discord_id_lookup = {str(msg.id): msg.id for msg in message_history}
     username_id_map: dict[str, int] = {}
     for msg in message_history:
-        username_id_map.setdefault(msg.author.name, msg.author.id)
-        username_id_map.setdefault(msg.author.display_name, msg.author.id)
+        # Keep ID resolution aligned with whichever name field the LLM saw in history
+        llm_visible_name = msg.author.name if use_username_for_llm else msg.author.display_name
+        username_id_map.setdefault(llm_visible_name, msg.author.id)
     normalized_username_id_map = _build_normalized_username_id_map(username_id_map)
-    participant_user_ids = {msg.author.id for msg in message_history}
 
     # Ensure channel_name is not None
     if channel_name is None:
@@ -695,7 +703,6 @@ async def get_candidate_features(
             target_username=target_username,
             username_id_map=username_id_map,
             normalized_username_id_map=normalized_username_id_map,
-            participant_user_ids=participant_user_ids,
         )
         
         # Resolve the candidate's message_id (which may be relative or a Discord ID)
