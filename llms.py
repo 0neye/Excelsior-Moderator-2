@@ -465,7 +465,7 @@ async def extract_features_from_formatted_history(
     4. Output a JSON object matching the provided schema with all candidates and their features.
 
     ### Features (all float values between 0 and 1):
-    - "discusses_ellie": The degree to which "Ellie" is a significant topic of discussion for the author of this candidate message. Ellie's @ mention is "<@1333546604694732892>," which also counts.
+    - "discusses_ellie": The degree to which "Ellie" is a significant topic of discussion for the author of this candidate message. References to Ellie (including @mentions like <@Ellie> or <@Ellie#9658>) count.
     - "familiarity_score": How familiar the author of the candidate message seems to be with the target user.
     - "tone_harshness_score": Overall harshness/condescension level independent of content.
     - "positive_framing_score": Does it use positive language ("I like X", "consider trying Y") vs negative ("X is wrong", "your layout is unoptimal")?

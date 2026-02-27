@@ -1,4 +1,5 @@
 from typing import Any, Optional, Tuple, List, Union
+import re
 import discord
 
 from config import CHANNEL_ALLOW_LIST
@@ -169,6 +170,35 @@ def _resolve_reference_username(message: discord.Message) -> str | None:
     return "deleted message"
 
 
+def _replace_direct_mentions_with_names(message: discord.Message, use_username: bool) -> str:
+    """
+    Replace raw Discord user mention tokens with normalized <@name> values.
+
+    Args:
+        message: Message whose content should be normalized
+        use_username: Whether mention text should use username or display name
+
+    Returns:
+        Message content with <@id>/<@!id> mention tokens rewritten as <@name>
+    """
+    mention_name_by_id: dict[int, str] = {}
+
+    # Keep mention formatting aligned with the selected message-name mode
+    for mentioned_user in message.mentions:
+        selected_name = mentioned_user.name if use_username else mentioned_user.display_name
+        mention_name_by_id[mentioned_user.id] = f"<@{selected_name}>"
+
+    if not mention_name_by_id:
+        return message.content
+
+    # Replace both mention forms while leaving unmatched IDs untouched
+    def _replace_match(match: re.Match[str]) -> str:
+        mentioned_user_id = int(match.group(1))
+        return mention_name_by_id.get(mentioned_user_id, match.group(0))
+
+    return re.sub(r"<@!?(\d+)>", _replace_match, message.content)
+
+
 def format_discord_message(
     message: discord.Message,
     relative_id: int | None = None,
@@ -211,7 +241,8 @@ def format_discord_message(
         )
         reply = f"[reply to {reply_str}] "
 
-    content = message.content
+    # Normalize raw mention tokens so LLM sees stable human-readable @names
+    content = _replace_direct_mentions_with_names(message, use_username)
     if message.attachments:
         content += " [uploaded attachment/image]"
 
