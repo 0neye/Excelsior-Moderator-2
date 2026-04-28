@@ -127,32 +127,6 @@ def _get_provider_lock(provider: str) -> asyncio.Lock:
     return lock
 
 
-def _is_rate_limit_error(error: Exception) -> bool:
-    """
-    Return True when an exception likely represents an HTTP 429 response.
-
-    Args:
-        error: Exception raised by an LLM client call.
-
-    Returns:
-        True when error metadata or message suggests rate limiting.
-    """
-    # Check common SDK status code attributes first for reliable detection
-    status_code = getattr(error, "status_code", None)
-    if status_code == 429:
-        return True
-
-    # Some SDKs attach HTTP details under a nested response object
-    response = getattr(error, "response", None)
-    nested_status_code = getattr(response, "status_code", None)
-    if nested_status_code == 429:
-        return True
-
-    # Fallback to message text matching for provider-specific exception formats
-    message = str(error).lower()
-    return "429" in message or "rate limit" in message or "too many requests" in message
-
-
 def _normalize_openrouter_model(model: str) -> str:
     """
     Normalize model name to a valid OpenRouter model ID.
@@ -540,10 +514,10 @@ async def extract_features_from_formatted_history(
             try:
                 response: Any = await _run_llm_call("cerebras", _cerebras_request)
             except Exception as cerebras_error:
-                # On 429, retry through OpenRouter while requesting Cerebras-first routing
-                if _is_rate_limit_error(cerebras_error) and OPENROUTER_API_KEY:
+                if OPENROUTER_API_KEY:
                     logger.warning(
-                        "Cerebras rate limited feature extraction request; retrying via OpenRouter with Cerebras provider preference"
+                        "Cerebras feature extraction request failed; retrying via OpenRouter with Cerebras provider preference",
+                        exc_info=cerebras_error,
                     )
                     effective_provider = "openrouter"
                     response = await _run_llm_call(
