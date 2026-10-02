@@ -880,14 +880,14 @@ class ExcelsiorBot(discord.Bot):
                 for row in db_session.query(FlaggedMessage).filter(
                     FlaggedMessage.message_id.in_(candidate_message_ids_to_flag),
                 ).all()
-            }
+            } if candidate_message_ids_to_flag else {}
             result.flagged_existing_count = len(existing_flags)
             runtime_feature_ids = {
                 row[0] for row in db_session.query(MessageFeatures.message_id).filter(
                     MessageFeatures.extraction_run_id.is_(None),
                     MessageFeatures.message_id.in_(candidate_message_ids_to_flag),
                 ).all()
-            }
+            } if candidate_message_ids_to_flag else set()
 
             for candidate, candidate_message, prediction in zip(candidates, candidate_messages, predictions):
                 if prediction != "flag":

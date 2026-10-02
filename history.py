@@ -108,14 +108,13 @@ class MessageStore:
         channel = message.channel
         channel_id = channel.id
         channel_deque = self._get_channel_deque(channel_id)
-        if not any(stored.id == message.id for stored in channel_deque):
-            if not channel_deque or message.id > channel_deque[-1].id:
-                channel_deque.append(message)
-            else:
-                # Reconnect history can arrive after newer live messages.
-                ordered = sorted([*channel_deque, message], key=lambda stored: stored.id)
-                channel_deque.clear()
-                channel_deque.extend(ordered[-self._max_size:])
+        if not channel_deque or message.id > channel_deque[-1].id:
+            channel_deque.append(message)
+        elif not any(stored.id == message.id for stored in channel_deque):
+            # Reconnect history can arrive after newer live messages.
+            ordered = sorted([*channel_deque, message], key=lambda stored: stored.id)
+            channel_deque.clear()
+            channel_deque.extend(ordered[-self._max_size:])
         
         # Update channel info (handles both TextChannel and Thread)
         if isinstance(channel, (discord.TextChannel, discord.Thread)):

@@ -77,6 +77,9 @@ def load_all_features_from_db() -> dict[int, list[dict[str, float]]]:
         run_features = (
             session.query(MessageFeatures, FeatureExtractionRun)
             .join(FeatureExtractionRun, MessageFeatures.extraction_run_id == FeatureExtractionRun.id)
+            .filter(MessageFeatures.message_id.notin_(
+                session.query(MessageFeatures.message_id).filter(MessageFeatures.extraction_run_id.is_(None))
+            ))
             .order_by(
                 MessageFeatures.message_id,
                 FeatureExtractionRun.created_at.desc(),
@@ -86,11 +89,8 @@ def load_all_features_from_db() -> dict[int, list[dict[str, float]]]:
             .all()
         )
 
-        runtime_message_ids = set(features_by_message)
         selected_runs: dict[int, int] = {}
         for record, extraction_run in run_features:
-            if record.message_id in runtime_message_ids:
-                continue
             selected_run_id = selected_runs.setdefault(record.message_id, extraction_run.id)
             if extraction_run.id == selected_run_id:
                 features_by_message.setdefault(record.message_id, []).append(record.features)

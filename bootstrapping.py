@@ -26,7 +26,7 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
 )
-from sklearn.model_selection import GroupShuffleSplit, train_test_split
+from sklearn.model_selection import train_test_split
 
 from config import CHANNEL_ALLOW_LIST, DISCORD_BOT_TOKEN, HISTORY_PER_CHECK
 from database import (
@@ -45,6 +45,7 @@ from ml import (
     build_monotone_constraints,
     create_classifier,
 )
+from training import collapse_category_label
 from user_stats import (
     bootstrap_user_stats,
     build_author_id_map,
@@ -564,8 +565,6 @@ async def fetch_discord_context(rated_messages: list[RatedMessage]) -> list[Rate
         if DISCORD_BOT_TOKEN is None:
             raise ValueError("DISCORD_BOT_TOKEN is not set in environment")
         await client.start(DISCORD_BOT_TOKEN)
-    except asyncio.CancelledError:
-        raise
     except Exception as e:
         logger.error(f"Discord client error: {e}")
     finally:
@@ -1227,22 +1226,6 @@ async def extract_features(
 # STEP 4: Train Model
 # =============================================================================
 
-def collapse_category_label(category: str) -> str:
-    """
-    Map rating categories to production moderation labels.
-    
-    Args:
-        category: Original rating category
-    Returns:
-        Production moderation label
-    """
-    if category in {"NA", "no-flag", "ambiguous"}:
-        return "no-flag"
-    if category in {"unsolicited", "unconstructive"}:
-        return "flag"
-    raise ValueError(f"Unknown rating category: {category}")
-
-
 def refresh_stat_features(messages_with_features: list[RatedMessage]) -> None:
     """
     Refresh seniority and familiarity stats from the database for all messages.
@@ -1535,19 +1518,15 @@ def prepare_training_data(
         and test_group_count >= len(label_counts)
         and len(unique_message_ids) - test_group_count >= len(label_counts)
     )
-    if can_stratify_groups:
-        group_labels = [next(iter(labels)) for labels in message_labels]
-        train_message_ids, test_message_ids = train_test_split(
-            unique_message_ids,
-            test_size=test_size,
-            random_state=random_state,
-            stratify=group_labels,
-        )
-        train_indices = np.flatnonzero(np.isin(groups, train_message_ids))
-        test_indices = np.flatnonzero(np.isin(groups, test_message_ids))
-    else:
-        splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
-        train_indices, test_indices = next(splitter.split(X, y, groups))
+    group_labels = [next(iter(labels)) for labels in message_labels] if can_stratify_groups else None
+    train_message_ids, test_message_ids = train_test_split(
+        unique_message_ids,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=group_labels,
+    )
+    train_indices = np.flatnonzero(np.isin(groups, train_message_ids))
+    test_indices = np.flatnonzero(np.isin(groups, test_message_ids))
 
     X_train, X_test = X[train_indices], X[test_indices]
     y_train, y_test = y[train_indices], y[test_indices]
