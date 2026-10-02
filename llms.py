@@ -207,18 +207,24 @@ async def _run_llm_call(provider: str, call: Callable[[], Any]) -> Any:
     lock = _get_provider_lock(provider)
     await lock.acquire()
     task = asyncio.create_task(asyncio.to_thread(call))
-    release_now = True
+    release_after_completion = False
+
+    def release_after_worker(completed_task: asyncio.Task) -> None:
+        try:
+            completed_task.result()
+        except (asyncio.CancelledError, Exception):
+            pass
+        lock.release()
+
     try:
         return await asyncio.wait_for(asyncio.shield(task), timeout=LLM_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        release_now = False
-        def _release(_task: asyncio.Task) -> None:
-            if lock.locked():
-                lock.release()
-        task.add_done_callback(_release)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        if not task.done():
+            release_after_completion = True
+            task.add_done_callback(release_after_worker)
         raise
     finally:
-        if release_now and lock.locked():
+        if not release_after_completion:
             lock.release()
 
 cerebras_client: Cerebras | None = None
