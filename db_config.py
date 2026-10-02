@@ -67,11 +67,54 @@ def _ensure_backwards_compatible_schema() -> None:
             "ALTER TABLE flagged_messages ADD COLUMN waiver_filtered BOOLEAN NOT NULL DEFAULT 0"
         )
 
-    if not migration_statements:
+    # Execute each additive migration in order inside a single transaction scope
+    if migration_statements:
+        with engine.begin() as connection:
+            for migration_statement in migration_statements:
+                connection.execute(text(migration_statement))
+
+    if "flagged_message_ratings" not in existing_tables:
         return
 
-    # Execute each additive migration in order inside a single transaction scope
+    uniqueness_columns = {"rater_user_id", "flagged_message_id"}
+    has_rating_uniqueness = any(
+        set(constraint["column_names"] or []) == uniqueness_columns
+        for constraint in db_inspector.get_unique_constraints("flagged_message_ratings")
+    ) or any(
+        index["unique"] and set(index["column_names"] or []) == uniqueness_columns
+        for index in db_inspector.get_indexes("flagged_message_ratings")
+    )
+    if has_rating_uniqueness:
+        return
+
     with engine.begin() as connection:
-        for migration_statement in migration_statements:
-            connection.execute(text(migration_statement))
+        duplicates = connection.execute(
+            text(
+                "SELECT rater_user_id, flagged_message_id "
+                "FROM flagged_message_ratings "
+                "GROUP BY rater_user_id, flagged_message_id HAVING COUNT(*) > 1"
+            )
+        ).mappings()
+        for pair in duplicates:
+            rows = connection.execute(
+                text(
+                    "SELECT id FROM flagged_message_ratings "
+                    "WHERE rater_user_id = :rater_user_id "
+                    "AND flagged_message_id = :flagged_message_id "
+                    "ORDER BY CASE WHEN completed_at IS NULL THEN 1 ELSE 0 END, "
+                    "completed_at DESC, started_at DESC, id DESC"
+                ),
+                pair,
+            ).scalars()
+            for duplicate_id in list(rows)[1:]:
+                connection.execute(
+                    text("DELETE FROM flagged_message_ratings WHERE id = :id"),
+                    {"id": duplicate_id},
+                )
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX uq_flagged_message_rating_rater_message "
+                "ON flagged_message_ratings (rater_user_id, flagged_message_id)"
+            )
+        )
 

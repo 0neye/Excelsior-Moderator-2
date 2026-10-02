@@ -9,7 +9,8 @@ from typing import Optional
 
 import discord
 from discord.ext import commands
-from sqlalchemy import func
+from sqlalchemy import func, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from config import (
@@ -56,6 +57,21 @@ def _save_rating_metadata(metadata: dict) -> None:
         json.dump(metadata, f, indent=2)
 
 
+def _update_rating_metadata(**updates) -> None:
+    """Apply field updates to the latest metadata snapshot."""
+    metadata = _load_rating_metadata()
+    metadata.update(updates)
+    _save_rating_metadata(metadata)
+
+
+def _remove_rating_metadata(*keys: str) -> None:
+    """Remove fields from the latest metadata snapshot."""
+    metadata = _load_rating_metadata()
+    for key in keys:
+        metadata.pop(key, None)
+    _save_rating_metadata(metadata)
+
+
 def _get_ratings_since_retrain() -> int:
     """Get the number of new ratings since the last model retrain."""
     metadata = _load_rating_metadata()
@@ -82,6 +98,42 @@ def _reset_ratings_counter() -> None:
     metadata["new_ratings_since_retrain"] = 0
     _save_rating_metadata(metadata)
     logger.info("Reset new_ratings_since_retrain counter to 0")
+
+
+def _record_completed_rating(
+    session: Session,
+    user_id: int,
+    flagged_message_id: int,
+    category: RatingCategory,
+) -> bool:
+    """Create a rating or replace the user's existing vote for the message."""
+    now = datetime.now(timezone.utc)
+    result = session.execute(
+        sqlite_insert(FlaggedMessageRating)
+        .values(
+            rating_id=f"{user_id}_{flagged_message_id}_{uuid.uuid4().hex[:8]}",
+            flagged_message_id=flagged_message_id,
+            rater_user_id=user_id,
+            category=category,
+            started_at=now,
+            completed_at=now,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["rater_user_id", "flagged_message_id"]
+        )
+    )
+    is_new_rating = result.rowcount == 1
+    if not is_new_rating:
+        session.execute(
+            update(FlaggedMessageRating)
+            .where(
+                FlaggedMessageRating.flagged_message_id == flagged_message_id,
+                FlaggedMessageRating.rater_user_id == user_id,
+            )
+            .values(category=category, completed_at=now)
+        )
+    session.commit()
+    return is_new_rating
 
 
 class RatingView(discord.ui.View):
@@ -157,32 +209,20 @@ class RatingView(discord.ui.View):
         self._rating_submitted = True
         self._interaction = interaction
 
-        # Generate unique rating ID
-        rating_id = f"{self.user_id}_{self.flagged_message_id}_{uuid.uuid4().hex[:8]}"
-
         # Save rating to DB
         session = self.get_db_session()
         try:
-            now = datetime.now(timezone.utc)
-            rating = FlaggedMessageRating(
-                rating_id=rating_id,
-                flagged_message_id=self.flagged_message_id,
-                rater_user_id=self.user_id,
-                category=category,
-                started_at=now,
-                completed_at=now,
+            is_new_rating = _record_completed_rating(
+                session, self.user_id, self.flagged_message_id, category
             )
-            session.add(rating)
-            session.commit()
         finally:
             session.close()
 
         logger.info(
-            "User %s completed rating %s for flagged message %s (rating_id=%s)",
+            "User %s completed rating %s for flagged message %s",
             self.user_id,
             category.value,
             self.flagged_message_id,
-            rating_id,
         )
 
         # Update the message
@@ -197,7 +237,7 @@ class RatingView(discord.ui.View):
 
         # Check if retraining threshold reached
         if self.on_retrain_check:
-            await self.on_retrain_check(is_new_rating=True)
+            await self.on_retrain_check(is_new_rating=is_new_rating)
 
     @discord.ui.button(label="No Flag", style=discord.ButtonStyle.green, emoji="✅")
     async def no_flag_button(
@@ -637,53 +677,17 @@ class Rating(commands.Cog):
                 )
                 return False
 
-            # Look up existing rating to allow overrides instead of ignoring
-            existing_rating = (
-                session.query(FlaggedMessageRating)
-                .filter(
-                    FlaggedMessageRating.flagged_message_id == post.flagged_message_id,
-                    FlaggedMessageRating.rater_user_id == payload.user_id,
-                )
-                .first()
-            )
-
             category = RATING_EMOJIS[emoji_str]
-            now = datetime.now(timezone.utc)
-            is_new_rating = False
-
-            if existing_rating:
-                # Update the user's previous rating with the new category
-                existing_rating.category = category
-                existing_rating.completed_at = now
-                session.commit()
-                logger.info(
-                    "User %s updated rating for flagged message %s to %s",
-                    payload.user_id,
-                    post.flagged_message_id,
-                    category.value,
-                )
-            else:
-                # Create a new rating entry for this user/message pair
-                is_new_rating = True
-                rating_id = f"{payload.user_id}_{post.flagged_message_id}_{uuid.uuid4().hex[:8]}"
-                rating = FlaggedMessageRating(
-                    rating_id=rating_id,
-                    flagged_message_id=post.flagged_message_id,
-                    rater_user_id=payload.user_id,
-                    category=category,
-                    started_at=now,
-                    completed_at=now,
-                )
-                session.add(rating)
-                session.commit()
-
-                logger.info(
-                    "User %s rated flagged message %s as %s (rating_id=%s)",
-                    payload.user_id,
-                    post.flagged_message_id,
-                    category.value,
-                    rating_id,
-                )
+            is_new_rating = _record_completed_rating(
+                session, payload.user_id, post.flagged_message_id, category
+            )
+            logger.info(
+                "User %s %s rating for flagged message %s to %s",
+                payload.user_id,
+                "added" if is_new_rating else "updated",
+                post.flagged_message_id,
+                category.value,
+            )
 
             # Update leaderboard
             await self.update_leaderboard()
@@ -790,15 +794,13 @@ Use `/view_score` to see your personal statistics."""
             return
 
         guild = channel.guild if hasattr(channel, "guild") else None
-        metadata = _load_rating_metadata()
-
         # Generate content
         scoreboard = await self._generate_scoreboard(guild)
         instructions_content = self._build_instructions_content()
         leaderboard_content = self._build_leaderboard_content(scoreboard)
 
         # Handle instructions message
-        instructions_message_id = metadata.get("instructions_message_id")
+        instructions_message_id = _load_rating_metadata().get("instructions_message_id")
         instructions_message = None
 
         if instructions_message_id:
@@ -810,7 +812,7 @@ Use `/view_score` to see your personal statistics."""
                     "Instructions message %s not found; creating new",
                     instructions_message_id,
                 )
-                metadata.pop("instructions_message_id", None)
+                _remove_rating_metadata("instructions_message_id")
                 instructions_message = None
             except Exception as e:
                 logger.error(
@@ -821,10 +823,10 @@ Use `/view_score` to see your personal statistics."""
 
         if instructions_message is None:
             new_msg = await channel.send(instructions_content)
-            metadata["instructions_message_id"] = new_msg.id
+            _update_rating_metadata(instructions_message_id=new_msg.id)
 
         # Handle leaderboard message
-        leaderboard_message_id = metadata.get("leaderboard_message_id")
+        leaderboard_message_id = _load_rating_metadata().get("leaderboard_message_id")
         leaderboard_message = None
 
         if leaderboard_message_id:
@@ -836,7 +838,7 @@ Use `/view_score` to see your personal statistics."""
                     "Leaderboard message %s not found; creating new",
                     leaderboard_message_id,
                 )
-                metadata.pop("leaderboard_message_id", None)
+                _remove_rating_metadata("leaderboard_message_id")
                 leaderboard_message = None
             except Exception as e:
                 logger.error(
@@ -847,11 +849,9 @@ Use `/view_score` to see your personal statistics."""
 
         if leaderboard_message is None:
             new_msg = await channel.send(leaderboard_content)
-            metadata["leaderboard_message_id"] = new_msg.id
+            _update_rating_metadata(leaderboard_message_id=new_msg.id)
 
-        # Save metadata
-        metadata["last_scoreboard"] = scoreboard
-        _save_rating_metadata(metadata)
+        _update_rating_metadata(last_scoreboard=scoreboard)
 
         logger.info(
             "Rating channel initialized with instructions and leaderboard messages"
@@ -865,10 +865,10 @@ Use `/view_score` to see your personal statistics."""
             return
 
         guild = channel.guild if hasattr(channel, "guild") else None
-        metadata = _load_rating_metadata()
-
         # Generate new scoreboard
         new_scoreboard = await self._generate_scoreboard(guild)
+
+        metadata = _load_rating_metadata()
 
         # Check if changed
         if new_scoreboard == metadata.get("last_scoreboard", ""):
@@ -885,16 +885,14 @@ Use `/view_score` to see your personal statistics."""
             content = self._build_leaderboard_content(new_scoreboard)
             await leaderboard_message.edit(content=content)
 
-            metadata["last_scoreboard"] = new_scoreboard
-            _save_rating_metadata(metadata)
+            _update_rating_metadata(last_scoreboard=new_scoreboard)
             logger.info("Leaderboard updated successfully")
         except discord.NotFound:
             logger.warning(
                 "Leaderboard message %s not found; reinitializing channel",
                 leaderboard_message_id,
             )
-            metadata.pop("leaderboard_message_id", None)
-            _save_rating_metadata(metadata)
+            _remove_rating_metadata("leaderboard_message_id")
             await self.init_rating_channel()
         except Exception as e:
             logger.error("Error updating leaderboard %s: %s", leaderboard_message_id, e)

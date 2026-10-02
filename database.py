@@ -101,6 +101,14 @@ class FlaggedMessageRating(Base):
     started_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     completed_at = Column(DateTime, nullable=True)
 
+    __table_args__ = (
+        UniqueConstraint(
+            "rater_user_id",
+            "flagged_message_id",
+            name="uq_flagged_message_rating_rater_message",
+        ),
+    )
+
 
 class LogChannelRatingPost(Base):
     """
