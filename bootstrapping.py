@@ -26,7 +26,7 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
 from config import CHANNEL_ALLOW_LIST, DISCORD_BOT_TOKEN, HISTORY_PER_CHECK
 from database import (
@@ -453,138 +453,123 @@ async def fetch_discord_context(rated_messages: list[RatedMessage]) -> list[Rate
     
     # List to collect newly fetched messages (accessible in on_ready closure)
     newly_fetched: list[RatedMessage] = []
+    client_closed = False
+
+    async def close_client() -> None:
+        nonlocal client_closed
+        if not client_closed:
+            client_closed = True
+            await client.close()
     
     @client.event
     async def on_ready():
         """Triggered when Discord client is ready."""
-        logger.info(f"Connected to Discord as {client.user}")
-        logger.info(f"Connected to {len(client.guilds)} guild(s)")
-        
-        # Group messages by channel to minimize API calls
-        messages_by_channel: dict[int, list[RatedMessage]] = defaultdict(list)
-        for msg in messages_needing_fetch:
-            messages_by_channel[msg.channel_id].append(msg)
-        
-        logger.info(f"Messages spread across {len(messages_by_channel)} channels")
-        
-        processed = 0
-        for channel_id, channel_messages in messages_by_channel.items():
-            logger.info(f"Processing channel {channel_id} ({len(channel_messages)} messages)...")
-            
-            # Try to get the channel
-            channel = client.get_channel(channel_id)
-            if channel is None:
-                try:
-                    channel = await client.fetch_channel(channel_id)
-                except discord.NotFound:
-                    logger.warning(f"Channel {channel_id} not found, skipping {len(channel_messages)} messages")
-                    fetch_errors["channel_not_found"] += len(channel_messages)
-                    continue
-                except discord.Forbidden:
-                    logger.warning(f"No access to channel {channel_id}, skipping {len(channel_messages)} messages")
-                    fetch_errors["channel_forbidden"] += len(channel_messages)
-                    continue
-            
-            # Cast to messageable channel type for type checker
-            messageable_channel = channel
-            if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-                logger.warning(f"Channel {channel_id} is not a text channel, skipping")
-                continue
-            
-            # Capture channel/thread names once per channel to reuse for each message
-            parent_channel_name: str | None = None
-            thread_name: str | None = None
-            if isinstance(channel, discord.Thread):
-                thread_name = channel.name
-                parent_channel_name = channel.parent.name if channel.parent else None
-                channel_name = parent_channel_name or channel.name
-            else:
-                channel_name = channel.name
-            
-            for rated_msg in channel_messages:
-                try:
-                    # Fetch messages around the flagged message
-                    context_messages: list[discord.Message] = []
-                    
-                    # Fetch messages before the flagged message
-                    before_count = HISTORY_PER_CHECK // 2
-                    async for msg in messageable_channel.history(
-                        limit=before_count,
-                        before=discord.Object(id=rated_msg.message_id),
-                        oldest_first=False
-                    ):
-                        context_messages.append(msg)
-                    
-                    # Reverse to get chronological order
-                    context_messages.reverse()
-                    
-                    # Fetch the flagged message itself
+        try:
+            logger.info(f"Connected to Discord as {client.user}")
+            logger.info(f"Connected to {len(client.guilds)} guild(s)")
+            messages_by_channel: dict[int, list[RatedMessage]] = defaultdict(list)
+            for msg in messages_needing_fetch:
+                messages_by_channel[msg.channel_id].append(msg)
+            logger.info(f"Messages spread across {len(messages_by_channel)} channels")
+            processed = 0
+            for channel_id, channel_messages in messages_by_channel.items():
+                logger.info(f"Processing channel {channel_id} ({len(channel_messages)} messages)...")
+                channel = client.get_channel(channel_id)
+                if channel is None:
                     try:
+                        channel = await client.fetch_channel(channel_id)
+                    except discord.NotFound:
+                        logger.warning(f"Channel {channel_id} not found, skipping {len(channel_messages)} messages")
+                        fetch_errors["channel_not_found"] += len(channel_messages)
+                        continue
+                    except discord.Forbidden:
+                        logger.warning(f"No access to channel {channel_id}, skipping {len(channel_messages)} messages")
+                        fetch_errors["channel_forbidden"] += len(channel_messages)
+                        continue
+                    except discord.HTTPException as exc:
+                        logger.warning(f"Could not fetch channel {channel_id}: {exc}")
+                        fetch_errors["channel_http_error"] += len(channel_messages)
+                        continue
+                messageable_channel = channel
+                if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+                    logger.warning(f"Channel {channel_id} is not a text channel, skipping")
+                    continue
+                parent_channel_name: str | None = None
+                thread_name: str | None = None
+                if isinstance(channel, discord.Thread):
+                    thread_name = channel.name
+                    parent_channel_name = channel.parent.name if channel.parent else None
+                    channel_name = parent_channel_name or channel.name
+                else:
+                    channel_name = channel.name
+                for rated_msg in channel_messages:
+                    try:
+                        context_messages: list[discord.Message] = []
+                        before_count = HISTORY_PER_CHECK // 2
+                        async for msg in messageable_channel.history(
+                            limit=before_count,
+                            before=discord.Object(id=rated_msg.message_id),
+                            oldest_first=False,
+                        ):
+                            context_messages.append(msg)
+                        context_messages.reverse()
                         flagged_msg = await messageable_channel.fetch_message(rated_msg.message_id)
                         context_messages.append(flagged_msg)
+                        after_count = HISTORY_PER_CHECK - before_count - 1
+                        async for msg in messageable_channel.history(
+                            limit=after_count,
+                            after=discord.Object(id=rated_msg.message_id),
+                            oldest_first=True,
+                        ):
+                            context_messages.append(msg)
+                        context_ids, serialized_context = serialize_context_messages(
+                            context_messages,
+                            channel_name=channel_name,
+                            parent_channel_name=parent_channel_name,
+                            thread_name=thread_name,
+                        )
+                        rated_msg.context_message_ids = context_ids
+                        rated_msg.channel_name = channel_name
+                        rated_msg.thread_name = thread_name
+                        rated_msg.context_messages = serialized_context
+                        newly_fetched.append(rated_msg)
+                        processed += 1
+                        if processed % 10 == 0:
+                            logger.info(f"Processed {processed}/{len(messages_needing_fetch)} messages")
+                        await asyncio.sleep(0.5)
+                    except discord.Forbidden:
+                        logger.warning(f"No access while fetching context for message {rated_msg.message_id}")
+                        fetch_errors["message_forbidden"] += 1
                     except discord.NotFound:
-                        logger.warning(f"Flagged message {rated_msg.message_id} not found")
+                        logger.warning(f"Context for message {rated_msg.message_id} was not found")
                         fetch_errors["message_not_found"] += 1
-                        continue
-                    
-                    # Fetch messages after the flagged message
-                    after_count = HISTORY_PER_CHECK - before_count - 1
-                    after_messages: list[discord.Message] = []
-                    async for msg in messageable_channel.history(
-                        limit=after_count,
-                        after=discord.Object(id=rated_msg.message_id),
-                        oldest_first=True
-                    ):
-                        after_messages.append(msg)
-                    context_messages.extend(after_messages)
-                    
-                    # Store context message IDs and serialized data
-                    context_ids, serialized_context = serialize_context_messages(
-                        context_messages,
-                        channel_name=channel_name,
-                        parent_channel_name=parent_channel_name,
-                        thread_name=thread_name,
-                    )
-                    rated_msg.context_message_ids = context_ids
-                    rated_msg.channel_name = channel_name
-                    rated_msg.thread_name = thread_name
-                    rated_msg.context_messages = serialized_context
-                    
-                    newly_fetched.append(rated_msg)
-                    processed += 1
-                    
-                    if processed % 10 == 0:
-                        logger.info(f"Processed {processed}/{len(messages_needing_fetch)} messages")
-                    
-                    # Rate limiting - small delay between fetches
-                    await asyncio.sleep(0.5)
-                    
-                except discord.errors.RateLimited as e:
-                    logger.warning(f"Rate limited, waiting {e.retry_after}s...")
-                    await asyncio.sleep(e.retry_after)
-                    fetch_errors["rate_limited"] += 1
-                except Exception as e:
-                    logger.error(f"Error fetching context for message {rated_msg.message_id}: {e}")
-                    fetch_errors["other_error"] += 1
-        
-        logger.info(f"Discord fetch complete: {len(newly_fetched)}/{len(messages_needing_fetch)} successful")
-        
-        # Log error summary
-        if fetch_errors:
-            logger.info("Fetch errors:")
-            for error_type, count in fetch_errors.items():
-                logger.info(f"  {error_type}: {count}")
-        
-        # Close the client
-        await client.close()
+                    except discord.HTTPException as exc:
+                        logger.warning(f"HTTP error fetching context for message {rated_msg.message_id}: {exc}")
+                        fetch_errors["message_http_error"] += 1
+                    except Exception as exc:
+                        logger.error(f"Error fetching context for message {rated_msg.message_id}: {exc}")
+                        fetch_errors["other_error"] += 1
+            logger.info(f"Discord fetch complete: {len(newly_fetched)}/{len(messages_needing_fetch)} successful")
+
+            # Log error summary
+            if fetch_errors:
+                logger.info("Fetch errors:")
+                for error_type, count in fetch_errors.items():
+                    logger.info(f"  {error_type}: {count}")
+        finally:
+            await close_client()
     
     # Run the client
     try:
         if DISCORD_BOT_TOKEN is None:
             raise ValueError("DISCORD_BOT_TOKEN is not set in environment")
         await client.start(DISCORD_BOT_TOKEN)
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.error(f"Discord client error: {e}")
+    finally:
+        await close_client()
     
     # Combine cached and newly fetched messages
     messages_with_context.extend(newly_fetched)
@@ -974,6 +959,7 @@ async def extract_features(
     
     # Filter messages that have context
     messages_to_process = [m for m in rated_messages if m.context_messages]
+    rated_message_ids = {message.message_id for message in rated_messages}
     skipped = len(rated_messages) - len(messages_to_process)
     if skipped > 0:
         logger.warning(f"Skipping {skipped} messages without context")
@@ -1064,12 +1050,18 @@ async def extract_features(
                         return None, None
                     for ctx in rated_msg.context_messages:
                         if str(ctx.get("id")) == raw_id:
-                            return ctx.get("id"), ctx
+                            try:
+                                return int(ctx["id"]), ctx
+                            except (KeyError, TypeError, ValueError):
+                                return None, None
                     if raw_id.isdigit():
                         rel_val = int(raw_id)
                         if rel_val in rel_id_to_ctx:
                             ctx_match = rel_id_to_ctx[rel_val]
-                            return ctx_match.get("id"), ctx_match
+                            try:
+                                return int(ctx_match["id"]), ctx_match
+                            except (KeyError, TypeError, ValueError):
+                                return None, None
                     return None, None
 
                 async def _extract_with_retry() -> tuple[list[dict[str, Any]], dict[str, float], str | None]:
@@ -1140,6 +1132,8 @@ async def extract_features(
                             resolved_id, ctx_meta = _resolve_candidate_ctx(candidate.get("message_id"))
                             if resolved_id is None or ctx_meta is None:
                                 continue
+                            if resolved_id in rated_message_ids:
+                                continue
                             features_copy = dict(candidate.get("features", {}))
                             cand_target = candidate.get("target_username")
                             if isinstance(cand_target, str):
@@ -1169,7 +1163,7 @@ async def extract_features(
                                 thread_name=ctx_meta.get("thread_name", rated_msg.thread_name),
                                 category="NA",
                                 rater_user_id=rated_msg.rater_user_id,
-                                rating_id=f"auto-na-{rated_msg.message_id}-{msg_id}",
+                                rating_id=f"auto-na-{msg_id}",
                                 context_message_ids=rated_msg.context_message_ids,
                                 context_messages=rated_msg.context_messages,
                                 features=runs,
@@ -1198,16 +1192,20 @@ async def extract_features(
     
     # Collect successful results, preserving original order
     messages_with_features: list[RatedMessage] = []
-    extra_na_messages: list[RatedMessage] = []
+    extra_na_by_message: dict[int, RatedMessage] = {}
     for idx, result, extras in sorted(results, key=lambda x: x[0]):
         if result is not None:
             messages_with_features.append(result)
-        if extras:
-            extra_na_messages.extend(extras)
+        for extra in extras:
+            existing_extra = extra_na_by_message.get(extra.message_id)
+            if existing_extra is None:
+                extra_na_by_message[extra.message_id] = extra
+            else:
+                existing_extra.features.extend(extra.features or [])
 
-    if extra_na_messages:
-        logger.info(f"Added {len(extra_na_messages)} extra candidate messages labeled as NA")
-        messages_with_features.extend(extra_na_messages)
+    if extra_na_by_message:
+        logger.info(f"Added {len(extra_na_by_message)} extra candidate messages labeled as NA")
+        messages_with_features.extend(extra_na_by_message.values())
     
     logger.info(f"Feature extraction complete: {len(messages_with_features)} successful, {error_count} errors")
     
@@ -1486,6 +1484,7 @@ def prepare_training_data(
     # Build feature matrix
     X = []
     y = []
+    message_ids = []
     total_feature_vectors = 0
     
     for msg in messages_with_features:
@@ -1500,6 +1499,7 @@ def prepare_training_data(
             X.append(feature_vector)
             
             y.append(collapse_category_label(msg.category))
+            message_ids.append(msg.message_id)
             total_feature_vectors += 1
     
     X = np.array(X)
@@ -1514,10 +1514,43 @@ def prepare_training_data(
     label_distribution = dict(zip(*np.unique(y, return_counts=True)))
     logger.info(f"Label distribution: {label_distribution}")
     
-    # Stratified train/test split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y
+    groups = np.array(message_ids)
+    unique_message_ids = np.unique(groups)
+    if len(unique_message_ids) < 2:
+        raise ValueError("Need at least two distinct message IDs for group-aware train/test split")
+
+    labels_by_message: dict[int, set[str]] = defaultdict(set)
+    for message_id, label in zip(message_ids, y):
+        labels_by_message[message_id].add(label)
+    message_labels = [labels_by_message[message_id] for message_id in unique_message_ids]
+    test_group_count = int(np.ceil(len(unique_message_ids) * test_size))
+    label_counts = defaultdict(int)
+    for labels in message_labels:
+        if len(labels) == 1:
+            label_counts[next(iter(labels))] += 1
+    can_stratify_groups = (
+        all(len(labels) == 1 for labels in message_labels)
+        and len(label_counts) > 1
+        and min(label_counts.values()) >= 2
+        and test_group_count >= len(label_counts)
+        and len(unique_message_ids) - test_group_count >= len(label_counts)
     )
+    if can_stratify_groups:
+        group_labels = [next(iter(labels)) for labels in message_labels]
+        train_message_ids, test_message_ids = train_test_split(
+            unique_message_ids,
+            test_size=test_size,
+            random_state=random_state,
+            stratify=group_labels,
+        )
+        train_indices = np.flatnonzero(np.isin(groups, train_message_ids))
+        test_indices = np.flatnonzero(np.isin(groups, test_message_ids))
+    else:
+        splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+        train_indices, test_indices = next(splitter.split(X, y, groups))
+
+    X_train, X_test = X[train_indices], X[test_indices]
+    y_train, y_test = y[train_indices], y[test_indices]
     
     logger.info(f"Train set size: {len(y_train)}")
     logger.info(f"Test set size: {len(y_test)}")

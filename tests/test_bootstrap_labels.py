@@ -125,6 +125,41 @@ class BootstrapLabelTests(unittest.TestCase):
             ("completed-no-flag", "no-flag"),
         ])
 
+    def test_training_split_keeps_every_message_on_one_side(self):
+        messages = []
+        for message_id in range(1, 11):
+            category = "unsolicited" if message_id % 2 else "no-flag"
+            for rater_id in (1, 2):
+                message = self._message(message_id, category)
+                message.rater_user_id = rater_id
+                message.rating_id = f"{message_id}-{rater_id}"
+                message.features = [
+                    {"tone_harshness_score": float(message_id)},
+                    {"tone_harshness_score": float(message_id) + 0.1},
+                ]
+                messages.append(message)
+
+        train_features, test_features, train_labels, test_labels = prepare_training_data(
+            messages,
+            active_feature_names=["tone_harshness_score"],
+            refresh_stats=False,
+            test_size=0.3,
+        )
+
+        train_ids = {int(row[0]) for row in train_features}
+        test_ids = {int(row[0]) for row in test_features}
+        self.assertFalse(train_ids & test_ids)
+        self.assertEqual(set(train_labels), {"flag", "no-flag"})
+        self.assertEqual(set(test_labels), {"flag", "no-flag"})
+
+    def test_training_split_rejects_a_single_message(self):
+        with self.assertRaisesRegex(ValueError, "two distinct message IDs"):
+            prepare_training_data(
+                [self._message(1, "unsolicited")],
+                active_feature_names=["tone_harshness_score"],
+                refresh_stats=False,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

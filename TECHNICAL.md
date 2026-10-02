@@ -180,7 +180,7 @@ Full training pipeline for initial model development.
 3. Bootstrap user stats from Discord history
 4. Extract features via LLM (multiple runs for robustness)
 5. Train LightGBM classifier
-6. Evaluate with cross-validation and confusion matrices
+6. Evaluate on a held-out message set, keeping every vector and rating for a message on the same side
 
 **Interactive REPL Menu**:
 ```
@@ -320,6 +320,7 @@ New model used on next moderation run
 - **Feature Extraction Runs**: Created for each bootstrapping feature extraction
 - **Message Features**: Bulk inserted with `extraction_run_id` for versioning
 - Supports multiple runs per message for stochastic feature extraction
+- Keeps all vectors and ratings for a message together during train/test evaluation
 
 **Rating System**:
 - **Log Channel Posts**: Created when message is flagged
