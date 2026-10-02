@@ -18,6 +18,7 @@ from db_config import Base, engine, get_session, init_db
 # Defaults chosen to balance coverage and API limits
 DEFAULT_HISTORY_LIMIT = 10_000
 DEFAULT_WINDOW_SIZE = 30
+MAX_HISTORY_RETRIES = 3
 
 
 def _normalize_ratio(ratio: float) -> float:
@@ -94,14 +95,13 @@ def _get_or_create_user_stats(
             message_count=0,
             character_count=0,
         )
-        # Use savepoint so IntegrityError only rolls back this insert, not entire session
-        savepoint = session.begin_nested()
         try:
-            session.add(user_stats)
-            session.flush()
+            # The context manager releases successful savepoints immediately.
+            with session.begin_nested():
+                session.add(user_stats)
+                session.flush()
         except IntegrityError:
-            # User was inserted by another session/run; rollback savepoint and re-query
-            savepoint.rollback()
+            # User was inserted by another session/run; re-query after its savepoint rolled back.
             user_stats = session.query(UserStats).filter_by(user_id=user_id).first()
             if user_stats is None:
                 raise
@@ -138,14 +138,13 @@ def _get_or_create_co_occurrence(session: Session, user_a_id: int, user_b_id: in
     )
     if pair is None:
         pair = UserCoOccurrence(user_a_id=low_id, user_b_id=high_id, co_occurrence_count=0)
-        # Use savepoint so IntegrityError only rolls back this insert, not entire session
-        savepoint = session.begin_nested()
         try:
-            session.add(pair)
-            session.flush()
+            # The context manager releases successful savepoints immediately.
+            with session.begin_nested():
+                session.add(pair)
+                session.flush()
         except IntegrityError:
-            # Pair was inserted by another session/run; rollback savepoint and re-query
-            savepoint.rollback()
+            # Pair was inserted by another session/run; re-query after its savepoint rolled back.
             pair = (
                 session.query(UserCoOccurrence)
                 .filter_by(user_a_id=low_id, user_b_id=high_id)
@@ -253,15 +252,27 @@ async def _collect_channel_messages(
     """
     fetched: list[discord.Message] = []
     backoff = 1.0
+    retries = 0
 
     while len(fetched) < limit:
         remaining = limit - len(fetched)
         try:
-            async for message in channel.history(limit=remaining, oldest_first=False):
+            before = fetched[-1] if fetched else None
+            async for message in channel.history(
+                limit=remaining,
+                oldest_first=False,
+                before=before,
+            ):
                 fetched.append(message)
             break
+        except (discord.Forbidden, discord.NotFound):
+            raise
         except discord.errors.HTTPException as exc:
-            # Handle rate limits or transient HTTP errors
+            if 400 <= exc.status < 500 and exc.status != 429:
+                raise
+            if retries >= MAX_HISTORY_RETRIES:
+                raise
+            retries += 1
             retry_after = getattr(exc, "retry_after", None)
             wait_for = float(retry_after) if retry_after is not None else backoff
             await asyncio.sleep(wait_for)
