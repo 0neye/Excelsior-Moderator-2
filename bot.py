@@ -397,16 +397,12 @@ class ExcelsiorBot(discord.Bot):
 
             channel = self.get_channel(channel_id)
             if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-                # Channel unavailable; pause until next activity
-                state.has_new_message_since_check = False
-                state.messages_since_check = 0
-                state.idle_timer_started_at = None
-                state.pending_log_delivery = False
+                # Activity or reconnect initialization recreates the scheduler.
                 logger.warning(
-                    "Channel %s unavailable for moderation; state reset until next activity",
+                    "Channel %s unavailable for moderation; scheduler stopped with pending work preserved",
                     channel_id,
                 )
-                continue
+                return
 
             trigger_reason = self._determine_moderation_reason(state)
             try:

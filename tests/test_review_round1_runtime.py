@@ -43,16 +43,45 @@ class ReviewRound1RuntimeTests(state_fixtures.ModerationTestCase):
             timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc), **kwargs,
         )
 
-    async def test_pending_scheduler_waits_when_its_channel_is_unavailable(self):
+    async def test_pending_scheduler_stops_on_unavailable_channel_and_can_restart(self):
         self.state.pending_log_delivery = True
         with patch.object(self.bot, "get_channel", side_effect=[None, AssertionError("Scheduler spun")]) as lookup:
-            scheduler = self.start(self.bot._moderation_scheduler(self.channel.id))
-            await asyncio.sleep(0)
+            self.module.ExcelsiorBot._ensure_scheduler_task(self.bot, self.channel)
+            scheduler = self.state.task
+            self.tasks.append(scheduler)
+            await asyncio.wait_for(scheduler, 2)
             lookup.assert_called_once_with(self.channel.id)
-            self.assertFalse(self.state.pending_log_delivery)
-            self.assertFalse(scheduler.done())
-            scheduler.cancel()
-            await asyncio.gather(scheduler, return_exceptions=True)
+            self.assertTrue(self.state.pending_log_delivery)
+        self.module.ExcelsiorBot._ensure_scheduler_task(self.bot, self.channel)
+        restarted = self.state.task
+        self.tasks.append(restarted)
+        self.assertIsNot(restarted, scheduler)
+        await asyncio.sleep(0)
+        self.assertFalse(restarted.done())
+        self.assertFalse(self.state.pending_log_delivery)
+
+    async def test_unavailable_scheduler_preserves_an_active_manual_batch(self):
+        await self.add_messages(1, 30)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def extract(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return []
+
+        self.extract.side_effect = extract
+        manual = self.start(self.bot.run_moderation_now(self.channel))
+        await asyncio.wait_for(entered.wait(), 2)
+        with patch.object(self.bot, "get_channel", return_value=None):
+            scheduler = self.start(self.bot._moderation_scheduler(self.channel.id))
+            await asyncio.wait_for(scheduler, 2)
+        self.assertEqual(self.state.messages_since_check, 30)
+        release.set()
+        self.assertTrue((await asyncio.wait_for(manual, 2)).success)
+        self.assertEqual(self.state.messages_since_check, 0)
+        await self.add_messages(31, 60)
+        self.assertEqual(self.state.messages_since_check, 30)
+        self.assertTrue(self.bot._should_moderate(self.state))
 
     async def test_pending_send_freezes_first_30_and_leaves_next_30_eligible(self):
         import llms
