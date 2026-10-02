@@ -628,15 +628,14 @@ def save_to_database(rated_messages: list[RatedMessage]) -> None:
     updated_count = 0
     
     try:
-        messages_by_id = {row.message_id: row for row in session.query(FlaggedMessage).all()}
-        ratings_by_pair = {
-            (row.rater_user_id, row.flagged_message_id): row
-            for row in session.query(FlaggedMessageRating).all()
-        }
+        messages_by_id: dict[int, FlaggedMessage] = {}
         for rated_msg in _latest_votes(rated_messages):
             existing = messages_by_id.get(rated_msg.message_id)
+            if existing is None:
+                existing = session.query(FlaggedMessage).filter_by(message_id=rated_msg.message_id).first()
             
             if existing:
+                messages_by_id[rated_msg.message_id] = existing
                 # Update existing record with context data
                 existing.context_message_ids = rated_msg.context_message_ids
                 existing.context_messages = rated_msg.context_messages
@@ -662,8 +661,10 @@ def save_to_database(rated_messages: list[RatedMessage]) -> None:
                 messages_by_id[rated_msg.message_id] = flagged_msg
                 saved_count += 1
             
-            pair = (rated_msg.rater_user_id, rated_msg.message_id)
-            existing_rating = ratings_by_pair.get(pair)
+            existing_rating = session.query(FlaggedMessageRating).filter_by(
+                rater_user_id=rated_msg.rater_user_id,
+                flagged_message_id=rated_msg.message_id,
+            ).first()
             started_at, completed_at = _vote_timestamps(rated_msg)
             if existing_rating is not None:
                 existing_completed = existing_rating.completed_at or existing_rating.started_at
@@ -677,7 +678,6 @@ def save_to_database(rated_messages: list[RatedMessage]) -> None:
                     rater_user_id=rated_msg.rater_user_id,
                 )
                 session.add(existing_rating)
-                ratings_by_pair[pair] = existing_rating
 
             existing_rating.rating_id = rated_msg.rating_id
             existing_rating.category = RatingCategory(rated_msg.category)
