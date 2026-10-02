@@ -70,6 +70,8 @@ class FlaggedMessage(Base):
     was_acted_upon = Column(Boolean, nullable=False, default=True)
     # Marks records that were suppressed from Discord action due to waiver role
     waiver_filtered = Column(Boolean, nullable=False, default=False)
+    # Only runtime flags awaiting moderator-log delivery are retried.
+    pending_log_delivery = Column(Boolean, nullable=False, default=False)
 
 
 class FlaggedMessageRating(Base):

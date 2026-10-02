@@ -60,6 +60,7 @@ class ChannelModerationState:
     task: asyncio.Task | None = None
     moderation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     in_flight_message_count: int = 0
+    pending_log_delivery: bool = False
     consecutive_failures: int = 0
     cooldown_until: datetime | None = None
 
@@ -190,7 +191,7 @@ class ExcelsiorBot(discord.Bot):
         """
         if self._cooldown_remaining(state) is not None:
             return False
-        if state.messages_since_check >= MESSAGES_PER_CHECK:
+        if state.pending_log_delivery or state.messages_since_check >= MESSAGES_PER_CHECK:
             return True
         remaining = self._compute_idle_timeout(state)
         if remaining is not None and remaining <= 0:
@@ -400,6 +401,7 @@ class ExcelsiorBot(discord.Bot):
                 state.has_new_message_since_check = False
                 state.messages_since_check = 0
                 state.idle_timer_started_at = None
+                state.pending_log_delivery = False
                 logger.warning(
                     "Channel %s unavailable for moderation; state reset until next activity",
                     channel_id,
@@ -464,6 +466,21 @@ class ExcelsiorBot(discord.Bot):
         """
         Ensure schedulers are running for all tracked channels and threads seen at startup.
         """
+        with self.get_db_session() as session:
+            pending_channel_ids = {
+                row[0] for row in session.query(FlaggedMessage.channel_id).filter(
+                    FlaggedMessage.pending_log_delivery.is_(True),
+                    FlaggedMessage.waiver_filtered.is_(False),
+                ).distinct()
+            }
+        for channel_id in pending_channel_ids:
+            channel = self.get_channel(channel_id)
+            if isinstance(channel, (discord.TextChannel, discord.Thread)) and is_tracked_channel(channel):
+                state = self._get_or_create_channel_state(channel_id)
+                state.pending_log_delivery = True
+                self._ensure_scheduler_task(channel)
+                state.trigger_event.set()
+
         # Start tasks for allowed parent channels present in guilds
         for guild in self.guilds:
             for channel_id in CHANNEL_ALLOW_LIST:
@@ -487,12 +504,12 @@ class ExcelsiorBot(discord.Bot):
             flagged_message_id=flagged_message.message_id,
         ).first()
         if existing_post is not None:
+            flagged_message.pending_log_delivery = False
+            flagged_message.was_acted_upon = True
+            db_session.commit()
             return existing_post.bot_message_id
 
         # A reaction on the original message is separate from moderator-log delivery.
-        if flagged_message.was_acted_upon:
-            flagged_message.was_acted_upon = False
-            db_session.commit()
         message = self.message_store.get_message_by_id(
             flagged_message.message_id, flagged_message.channel_id,
         )
@@ -538,6 +555,7 @@ class ExcelsiorBot(discord.Bot):
             bot_message_id=log_message.id, flagged_message_id=flagged_message.message_id,
         ))
         flagged_message.was_acted_upon = True
+        flagged_message.pending_log_delivery = False
         db_session.commit()
         logger.info("Delivered flagged message %s as log post %s", flagged_message.message_id, log_message.id)
 
@@ -554,18 +572,20 @@ class ExcelsiorBot(discord.Bot):
         try:
             pending_flags = (
                 db_session.query(FlaggedMessage)
-                .outerjoin(LogChannelRatingPost, LogChannelRatingPost.flagged_message_id == FlaggedMessage.message_id)
                 .filter(
                     FlaggedMessage.channel_id == channel_id,
                     FlaggedMessage.waiver_filtered.is_(False),
-                    LogChannelRatingPost.id.is_(None),
+                    FlaggedMessage.pending_log_delivery.is_(True),
                 )
                 .order_by(FlaggedMessage.id)
                 .all()
             )
+            state = self._get_or_create_channel_state(channel_id)
+            state.pending_log_delivery = bool(pending_flags)
             for flagged_message in pending_flags:
                 if await self.flag_message(flagged_message, db_session) is None:
                     return False
+            state.pending_log_delivery = False
             return True
         finally:
             db_session.close()
@@ -586,12 +606,18 @@ class ExcelsiorBot(discord.Bot):
             reason="Moderation did not start.",
         )
 
+        # Freeze the history before any delivery await, matching _run_moderation's
+        # consumed counter/head even when new arrivals evict the live history.
+        store_history_copy = self.message_store.get_whole_history(channel.id)
         if not await self._retry_pending_log_deliveries(channel.id):
             result.reason = "Moderator log delivery is pending."
             return result
 
-        # Copy at time of call to avoid race conditions
-        store_history_copy = self.message_store.get_whole_history(channel.id)
+        if not store_history_copy:
+            result.success = True
+            result.reason = "No message history to moderate."
+            return result
+
         # Keep only the newest MESSAGES_PER_CHECK messages eligible for flagging.
         # Older messages in the history window are context-only.
         context_only_message_count = max(0, len(store_history_copy) - MESSAGES_PER_CHECK)
@@ -602,6 +628,7 @@ class ExcelsiorBot(discord.Bot):
             provider=DEFAULT_LLM_PROVIDER,
             model=DEFAULT_LLM_MODEL,
             ignore_first_message_count=context_only_message_count,
+            message_history=store_history_copy,
         )
         result.candidates_considered = len(candidates)
 
@@ -919,6 +946,7 @@ class ExcelsiorBot(discord.Bot):
                         target_username=candidate.get("target_username"),
                         was_acted_upon=False,
                         waiver_filtered=is_waiver_filtered,
+                        pending_log_delivery=not is_waiver_filtered,
                     )
                     db_session.add(flagged_message)
                     existing_flags[candidate_message.id] = flagged_message
@@ -938,11 +966,16 @@ class ExcelsiorBot(discord.Bot):
 
             # Retain every classified flag, including candidates after a failed send.
             db_session.commit()
+            state = self._get_or_create_channel_state(channel.id)
+            state.pending_log_delivery = any(
+                row.pending_log_delivery and not row.waiver_filtered for row in existing_flags.values()
+            )
             for flagged_message in existing_flags.values():
-                if not flagged_message.waiver_filtered:
+                if flagged_message.pending_log_delivery and not flagged_message.waiver_filtered:
                     if await self.flag_message(flagged_message, db_session) is None:
                         result.reason = "Moderator log delivery is pending."
                         return result
+            state.pending_log_delivery = False
         finally:
             db_session.close()
 

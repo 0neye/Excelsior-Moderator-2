@@ -109,13 +109,14 @@ class ModerationDeliveryTests(ModerationTestCase):
         self.assertEqual(self.records(), ([(1, True, False)], 1, 1))
         self.log_channel.send.assert_awaited_once()
 
-    async def test_existing_acted_flag_without_mapping_still_retries_delivery(self):
+    async def test_explicit_pending_flag_without_mapping_still_retries_delivery(self):
         from datetime import datetime, timezone
         with self.sessions() as session:
             session.add(self.module.FlaggedMessage(
                 message_id=1, channel_id=self.channel.id, guild_id=self.channel.guild.id,
                 author_id=789, author_username="Alice", content="persisted flag",
-                timestamp=datetime.now(timezone.utc), was_acted_upon=True, waiver_filtered=False,
+                timestamp=datetime.now(timezone.utc), was_acted_upon=False, waiver_filtered=False,
+                pending_log_delivery=True,
             ))
             session.commit()
         self.available = False

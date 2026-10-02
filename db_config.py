@@ -40,8 +40,8 @@ def _ensure_backwards_compatible_schema() -> None:
     """
     Apply additive schema migrations required for older SQLite databases.
 
-    This function only adds missing columns so existing deployments keep working
-    without dropping or rewriting existing data.
+    Add delivery/waiver columns and repair completed votes before enforcing
+    one vote per rater and message. Historical imports remain handled.
     """
     db_inspector = inspect(engine)
     existing_tables = set(db_inspector.get_table_names())
@@ -67,6 +67,22 @@ def _ensure_backwards_compatible_schema() -> None:
             "ALTER TABLE flagged_messages ADD COLUMN waiver_filtered BOOLEAN NOT NULL DEFAULT 0"
         )
 
+    if "pending_log_delivery" not in flagged_columns:
+        migration_statements.append(
+            "ALTER TABLE flagged_messages ADD COLUMN pending_log_delivery BOOLEAN NOT NULL DEFAULT 0"
+        )
+        # Historical imports have no runtime features. Recover only proven runtime
+        # work; an absent mapping alone is not evidence that delivery is pending.
+        if {"message_features", "log_channel_rating_posts"} <= existing_tables:
+            migration_statements.append(
+                "UPDATE flagged_messages SET pending_log_delivery = 1 "
+                "WHERE waiver_filtered = 0 AND EXISTS ("
+                "SELECT 1 FROM message_features WHERE message_id = flagged_messages.message_id "
+                "AND extraction_run_id IS NULL) AND NOT EXISTS ("
+                "SELECT 1 FROM log_channel_rating_posts "
+                "WHERE flagged_message_id = flagged_messages.message_id)"
+            )
+
     # Execute each additive migration in order inside a single transaction scope
     if migration_statements:
         with engine.begin() as connection:
@@ -75,6 +91,14 @@ def _ensure_backwards_compatible_schema() -> None:
 
     if "flagged_message_ratings" not in existing_tables:
         return
+
+    # Old imports stored completed categories without completion timestamps.
+    # Repair before deduplication, including databases already carrying the index.
+    with engine.begin() as connection:
+        connection.execute(text(
+            "UPDATE flagged_message_ratings SET completed_at = started_at "
+            "WHERE category IS NOT NULL AND completed_at IS NULL"
+        ))
 
     uniqueness_columns = {"rater_user_id", "flagged_message_id"}
     has_rating_uniqueness = any(
@@ -101,7 +125,7 @@ def _ensure_backwards_compatible_schema() -> None:
                     "SELECT id FROM flagged_message_ratings "
                     "WHERE rater_user_id = :rater_user_id "
                     "AND flagged_message_id = :flagged_message_id "
-                    "ORDER BY CASE WHEN completed_at IS NULL THEN 1 ELSE 0 END, "
+                    "ORDER BY CASE WHEN category IS NULL OR completed_at IS NULL THEN 1 ELSE 0 END, "
                     "completed_at DESC, started_at DESC, id DESC"
                 ),
                 pair,

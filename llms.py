@@ -3,6 +3,8 @@ import json
 import logging
 from typing import Any, Callable, Literal
 
+import discord
+
 from cerebras.cloud.sdk import Cerebras
 from google import genai
 from openai import OpenAI
@@ -596,6 +598,7 @@ async def extract_features_from_formatted_history(
 async def get_candidate_features(
     message_store: MessageStore,
     channel_id: int,
+    message_history: list[discord.Message],
     provider: Literal["cerebras", "openrouter", "gemini"],
     model: str,
     required_message_indexes: list[int] | None = None,
@@ -608,6 +611,7 @@ async def get_candidate_features(
     Args:
         message_store: The MessageStore containing channel history
         channel_id: The Discord channel ID to analyze
+        message_history: Frozen history for this moderation pass
         provider: LLM provider to use ("cerebras", "openrouter", or "gemini")
         model: Model identifier to use with the provider
         required_message_indexes: Optional list of relative message IDs that MUST have
@@ -625,7 +629,6 @@ async def get_candidate_features(
     channel_name = channel_info.channel_name if not channel_info.is_thread else channel_info.parent_channel_name
     thread_name = channel_info.channel_name if channel_info.is_thread else None
 
-    message_history = message_store.get_whole_history(channel_id)
     use_username_for_llm = _should_use_username_for_llm()
     formatted_message_history_list = format_message_history(
         message_history,
