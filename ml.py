@@ -217,12 +217,14 @@ class LightGBMClassifier(ModerationClassifier):
         """Train the LightGBM classifier."""
         import lightgbm as lgb
 
+        labels = set(map(str, y))
+        if not labels <= {"flag", "no-flag"}:
+            raise ValueError(f"Moderation models require flag/no-flag labels, got {sorted(labels)}")
+
         logger.info(f"Training LightGBM with {len(y)} samples...")
 
         y_encoded = self.label_encoder.fit_transform(y)
         classes = self.label_encoder.classes_
-        n_classes = len(classes) if classes is not None else 0
-
         logger.info(f"Classes: {list(classes) if classes is not None else []}")
         logger.info(f"Class distribution: {dict(zip(*np.unique(y, return_counts=True)))}")
 
@@ -233,7 +235,7 @@ class LightGBMClassifier(ModerationClassifier):
             num_leaves=self.num_leaves,
             class_weight=self.class_weight,
             random_state=self.random_state,
-            objective="multiclass" if n_classes > 2 else "binary",
+            objective="binary",
             monotone_constraints=self.monotone_constraints,
             verbose=-1,
         )

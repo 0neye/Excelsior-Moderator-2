@@ -80,7 +80,7 @@ LightGBM classifier implementation with abstract base class pattern.
 - 200 estimators
 - Max depth: 6
 - Learning rate: 0.1
-- Binary or multi-class objective
+- Binary objective
 - Optional monotone constraints aligned to feature order
 
 ### 4. Training Module (`training.py`)
@@ -94,11 +94,9 @@ Continuous training system that automatically retrains on new ratings.
   - Reuses stored context when available
   - Fetches context from Discord API by `channel_id` + `message_id` when context is missing
 
-**Category Collapsing** (configurable):
-- **Binary mode** (default): flag/no-flag (recommended for <2000 ratings)
-  - `"flag"`: "unsolicited" + "unconstructive"
-  - `"no-flag"`: "NA" + "no-flag" + "ambiguous" (if enabled)
-- **Multi-class mode**: All 5 categories (requires substantial balanced data)
+**Training labels**: The production classifier always predicts `flag` or `no-flag`.
+- `"flag"`: "unsolicited" and "unconstructive"
+- `"no-flag"`: "NA", "no-flag", and "ambiguous"
 
 **Trigger**: Automatically after `NEW_RATINGS_BEFORE_RETRAIN` new ratings (default: 20)
 
@@ -300,15 +298,14 @@ New model used on next moderation run
    - **`extract_on_demand`**: Extract missing features via LLM using DB-backed rated messages; missing context is fetched from Discord when possible
 3. Prepare training data:
    - Build feature matrix X with 18 features
-   - Build label vector y with rating categories
-   - Apply category collapsing if enabled
+   - Build a `flag`/`no-flag` label vector
 4. Train LightGBM classifier with balanced class weights and semantic monotonic constraints
 5. Save model to `models/lightgbm_model.joblib`
 6. Model is immediately used by bot (loaded on next moderation run)
 
 **Feature Sources** (priority order):
 1. Runtime features (no `extraction_run_id`)
-2. Most recent extraction run features
+2. Newest extraction-run features available for each message
 
 ### 4. Database Updates
 
@@ -608,8 +605,6 @@ Only the API key for the active `DEFAULT_LLM_PROVIDER` is required at runtime.
 ```python
 NEW_RATINGS_BEFORE_RETRAIN                   # Ratings before auto-retrain (default: 20)
 CONTINUOUS_TRAINING_FEATURE_MODE             # "existing_only" or "extract_on_demand"
-CONTINUOUS_TRAINING_COLLAPSE_CATEGORIES      # Collapse to binary flag/no-flag (default: True)
-CONTINUOUS_TRAINING_COLLAPSE_AMBIGUOUS       # Map ambiguous to no-flag (default: True)
 EXCLUDE_WAIVER_FILTERED_FROM_RATE_POOL       # Exclude waived-target rows from `/rate` pool
 EXCLUDE_WAIVER_FILTERED_FROM_COVERAGE        # Exclude waived-target rows from coverage denominators
 EXCLUDE_WAIVER_FILTERED_FROM_TRAINING        # Exclude waived-target rows from training dataset
@@ -625,9 +620,7 @@ EXCLUDE_WAIVER_FILTERED_FROM_TRAINING        # Exclude waived-target rows from t
 - `EXCLUDE_WAIVER_FILTERED_FROM_TRAINING=True` keeps retraining focused on messages where moderation action was not waiver-suppressed
 - Similar exclusions are available independently for public rating pool and coverage analytics
 
-**Category Collapsing**:
-- **Binary mode** (recommended): Simpler classification, works with <2000 ratings
-- **Multi-class mode**: All 5 categories, requires substantial balanced training data
+**Training labels**: `flag` combines unsolicited and unconstructive ratings. `no-flag` combines NA, no-flag, and ambiguous ratings.
 
 ### Database Settings
 
@@ -1147,8 +1140,7 @@ SELECT category, COUNT(*)
 FROM flagged_message_ratings 
 GROUP BY category;
 ```
-3. **Retrain with balanced data**: Ensure reasonable distribution across categories
-4. **Use binary mode**: If multi-class, switch to binary (flag/no-flag) in `config.py`
+3. **Retrain with balanced data**: Ensure reasonable distribution between flag and no-flag labels
 
 **Debug steps**:
 1. Check model predictions in console logs (debug mode)

@@ -15,7 +15,7 @@ import sys
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -113,8 +113,6 @@ class BootstrapState:
     y_test: np.ndarray | None = None
     model: Any = None
     model_type: str = "lightgbm"
-    collapse_categories: bool = False
-    collapse_ambiguous_to_no_flag: bool = False
     active_feature_names: list[str] = field(default_factory=lambda: FEATURE_NAMES.copy())
     ignored_features: set[str] = field(default_factory=set)
 
@@ -345,7 +343,7 @@ def load_rating_data() -> list[RatedMessage]:
     
     logger.info(f"Messages with completed ratings: {len(message_to_ratings)}")
     
-    # Join messages with their ratings
+    # Reconstruct every completed vote so each moderator's vote keeps its weight.
     rated_messages: list[RatedMessage] = []
     category_counts: dict[str, int] = defaultdict(int)
     
@@ -357,28 +355,27 @@ def load_rating_data() -> list[RatedMessage]:
         if not msg_ratings:
             continue  # Skip messages without completed ratings
         
-        # Use the first rating (could also implement majority voting for multiple ratings)
-        rating = msg_ratings[0]
-        category = rating["category"]
-        category_counts[category] += 1
-        
-        rated_msg = RatedMessage(
-            message_id=msg_id,
-            channel_id=msg_data["channel_id"],
-            guild_id=msg_data["guild_id"],
-            author_id=msg_data["author_id"],
-            author_name=msg_data["author_name"],
-            content=msg_data["content"],
-            timestamp=msg_data["timestamp"],
-            flagged_at=msg_data["flagged_at"],
-            jump_url=msg_data["jump_url"],
-            channel_name=msg_data.get("channel_name"),
-            thread_name=msg_data.get("thread_name"),
-            category=category,
-            rater_user_id=rating["rater_user_id"],
-            rating_id=rating["rating_id"],
-        )
-        rated_messages.append(rated_msg)
+        for rating in msg_ratings:
+            category = rating["category"]
+            category_counts[category] += 1
+            rated_messages.append(
+                RatedMessage(
+                    message_id=msg_id,
+                    channel_id=msg_data["channel_id"],
+                    guild_id=msg_data["guild_id"],
+                    author_id=msg_data["author_id"],
+                    author_name=msg_data["author_name"],
+                    content=msg_data["content"],
+                    timestamp=msg_data["timestamp"],
+                    flagged_at=msg_data["flagged_at"],
+                    jump_url=msg_data["jump_url"],
+                    channel_name=msg_data.get("channel_name"),
+                    thread_name=msg_data.get("thread_name"),
+                    category=category,
+                    rater_user_id=rating["rater_user_id"],
+                    rating_id=rating["rating_id"],
+                )
+            )
     
     # Log category distribution
     logger.info("Category distribution:")
@@ -663,6 +660,7 @@ def save_to_database(rated_messages: list[RatedMessage]) -> None:
                     flagged_message_id=rated_msg.message_id,
                     rater_user_id=rated_msg.rater_user_id,
                     category=category_map.get(rated_msg.category),
+                    completed_at=datetime.now(timezone.utc),
                 )
                 session.add(rating)
         
@@ -846,36 +844,40 @@ def load_features_from_db(
                 logger.warning(f"FlaggedMessage {message_id} not found, skipping")
                 continue
             
-            # Get the rating for this message
-            rating = session.query(FlaggedMessageRating).filter_by(
-                flagged_message_id=message_id
-            ).first()
-            
-            if rating is None:
-                logger.warning(f"No rating found for message {message_id}, skipping")
-                continue
-            
-            # Map rating category enum to string
-            category_str = rating.category.value if rating.category else "NA"
-            
-            rated_msg = RatedMessage(
-                message_id=flagged_msg.message_id,
-                channel_id=flagged_msg.channel_id,
-                guild_id=flagged_msg.guild_id,
-                author_id=flagged_msg.author_id,
-                author_name=flagged_msg.author_username or "",
-                content=flagged_msg.content,
-                timestamp=flagged_msg.timestamp.isoformat() if flagged_msg.timestamp else "",
-                flagged_at=flagged_msg.flagged_at.isoformat() if flagged_msg.flagged_at else "",
-                jump_url=f"https://discord.com/channels/{flagged_msg.guild_id}/{flagged_msg.channel_id}/{flagged_msg.message_id}",
-                category=category_str,
-                rater_user_id=rating.rater_user_id,
-                rating_id=rating.rating_id,
-                context_message_ids=flagged_msg.context_message_ids or [],
-                context_messages=flagged_msg.context_messages or [],
-                features=feature_list,
+            completed_ratings = (
+                session.query(FlaggedMessageRating)
+                .filter(
+                    FlaggedMessageRating.flagged_message_id == message_id,
+                    FlaggedMessageRating.category.isnot(None),
+                    FlaggedMessageRating.completed_at.isnot(None),
+                )
+                .order_by(FlaggedMessageRating.completed_at, FlaggedMessageRating.id)
+                .all()
             )
-            messages_with_features.append(rated_msg)
+            if not completed_ratings:
+                logger.warning(f"No completed ratings found for message {message_id}, skipping")
+                continue
+
+            for rating in completed_ratings:
+                messages_with_features.append(
+                    RatedMessage(
+                        message_id=flagged_msg.message_id,
+                        channel_id=flagged_msg.channel_id,
+                        guild_id=flagged_msg.guild_id,
+                        author_id=flagged_msg.author_id,
+                        author_name=flagged_msg.author_username or "",
+                        content=flagged_msg.content,
+                        timestamp=flagged_msg.timestamp.isoformat() if flagged_msg.timestamp else "",
+                        flagged_at=flagged_msg.flagged_at.isoformat() if flagged_msg.flagged_at else "",
+                        jump_url=f"https://discord.com/channels/{flagged_msg.guild_id}/{flagged_msg.channel_id}/{flagged_msg.message_id}",
+                        category=rating.category.value,
+                        rater_user_id=rating.rater_user_id,
+                        rating_id=rating.rating_id,
+                        context_message_ids=flagged_msg.context_message_ids or [],
+                        context_messages=flagged_msg.context_messages or [],
+                        features=feature_list,
+                    )
+                )
         
         logger.info(f"Loaded {len(messages_with_features)} messages with features from DB")
         return messages_with_features
@@ -1227,27 +1229,20 @@ async def extract_features(
 # STEP 4: Train Model
 # =============================================================================
 
-def collapse_category_label(
-    category: str,
-    collapse_ambiguous_to_no_flag: bool = False
-) -> str:
+def collapse_category_label(category: str) -> str:
     """
-    Normalize category labels when collapsing classes.
+    Map rating categories to production moderation labels.
     
     Args:
         category: Original rating category
-        collapse_ambiguous_to_no_flag: Whether to map ambiguous to no-flag
-        
     Returns:
-        Collapsed category label following the mapping rules
+        Production moderation label
     """
-    if category in {"NA", "no-flag"}:
+    if category in {"NA", "no-flag", "ambiguous"}:
         return "no-flag"
     if category in {"unsolicited", "unconstructive"}:
         return "flag"
-    if collapse_ambiguous_to_no_flag and category == "ambiguous":
-        return "no-flag"
-    return category
+    raise ValueError(f"Unknown rating category: {category}")
 
 
 def refresh_stat_features(messages_with_features: list[RatedMessage]) -> None:
@@ -1371,8 +1366,6 @@ def prepare_training_data(
     messages_with_features: list[RatedMessage],
     test_size: float = 0.2,
     random_state: int = 42,
-    collapse_categories: bool = False,
-    collapse_ambiguous_to_no_flag: bool = False,
     refresh_stats: bool = True,
     active_feature_names: list[str] | None = None,
     ignored_features: set[str] | None = None,
@@ -1385,8 +1378,6 @@ def prepare_training_data(
         messages_with_features: List of messages with extracted features
         test_size: Fraction of data to use for testing
         random_state: Random seed for reproducibility
-        collapse_categories: Whether to merge rating categories into broader buckets
-        collapse_ambiguous_to_no_flag: Whether to map ambiguous to no-flag when collapsing
         refresh_stats: Whether to refresh seniority/familiarity stats from the database
         active_feature_names: Ordered feature list to include (defaults to FEATURE_NAMES)
         ignored_features: Feature names to drop (ignored if active_feature_names supplied)
@@ -1508,13 +1499,7 @@ def prepare_training_data(
             feature_vector = [feature_payload.get(name, 0.0) for name in active_feature_names]
             X.append(feature_vector)
             
-            label = msg.category
-            if collapse_categories:
-                label = collapse_category_label(
-                    label,
-                    collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag
-                )
-            y.append(label)
+            y.append(collapse_category_label(msg.category))
             total_feature_vectors += 1
     
     X = np.array(X)
@@ -1527,8 +1512,7 @@ def prepare_training_data(
         len(active_feature_names),
     )
     label_distribution = dict(zip(*np.unique(y, return_counts=True)))
-    distribution_label = "collapsed label distribution" if collapse_categories else "label distribution"
-    logger.info(f"{distribution_label}: {label_distribution}")
+    logger.info(f"Label distribution: {label_distribution}")
     
     # Stratified train/test split
     X_train, X_test, y_train, y_test = train_test_split(
@@ -1711,9 +1695,7 @@ def print_state():
         print(f"  Test samples: {len(state.y_test)}")
     print(f"Model trained: {state.model is not None}")
     print(f"Model type: {state.model_type}")
-    print(f"Collapse categories: {state.collapse_categories}")
-    if state.collapse_categories:
-        print(f"  Collapse ambiguous to no-flag: {state.collapse_ambiguous_to_no_flag}")
+    print("Training labels: flag/no-flag")
     print(
         f"Active features: {len(state.active_feature_names)} "
         f"(ignored: {len(state.ignored_features)})"
@@ -1728,8 +1710,6 @@ async def run_full_pipeline(
     max_concurrent: int = 5,
     runs_per_message: int = 1,
     provider: str = "gemini",
-    collapse_categories: bool = False,
-    collapse_ambiguous_to_no_flag: bool = False,
     include_extra_candidates_as_na: bool = False,
     exclude_message_ids: set[int] | None = None,
 ):
@@ -1741,8 +1721,6 @@ async def run_full_pipeline(
         max_concurrent: Maximum concurrent API calls for feature extraction
         runs_per_message: How many times to extract features per rated message
         provider: LLM provider ("gemini" default, or "openrouter"/"cerebras")
-        collapse_categories: Whether to collapse rating categories before training
-        collapse_ambiguous_to_no_flag: Whether to map ambiguous to no-flag when collapsing
         include_extra_candidates_as_na: Whether to keep non-flagged candidates as NA
         exclude_message_ids: Message IDs to drop entirely before training
     """
@@ -1784,11 +1762,8 @@ async def run_full_pipeline(
         return
     
     # Step 4: Prepare data and train
-    logger.info(f"Collapsing categories for training: {collapse_categories}")
     X_train, X_test, y_train, y_test = prepare_training_data(
         state.messages_with_features,
-        collapse_categories=collapse_categories,
-        collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag,
         active_feature_names=state.active_feature_names,
         ignored_features=state.ignored_features,
         exclude_message_ids=state.excluded_message_ids,
@@ -1797,13 +1772,6 @@ async def run_full_pipeline(
     state.X_test = X_test
     state.y_train = y_train
     state.y_test = y_test
-    state.collapse_categories = collapse_categories
-    state.collapse_ambiguous_to_no_flag = collapse_ambiguous_to_no_flag
-    if collapse_categories:
-        logger.info(
-            "Collapse ambiguous into no-flag enabled: %s",
-            collapse_ambiguous_to_no_flag
-        )
     
     state.model = train_model(
         X_train,
@@ -1859,14 +1827,6 @@ async def repl():
                 "Include other LLM candidates as NA instead of dropping? (y/N): "
             ).strip().lower()
             include_extra_candidates_as_na = include_extra_input in {"y", "yes"}
-            collapse_input = input("Collapse categories for training? (y/N): ").strip().lower()
-            collapse_categories = collapse_input in {"y", "yes"}
-            collapse_ambiguous_to_no_flag = False
-            if collapse_categories:
-                collapse_ambiguous_input = input(
-                    "Collapse ambiguous into no-flag? (y/N): "
-                ).strip().lower()
-                collapse_ambiguous_to_no_flag = collapse_ambiguous_input in {"y", "yes"}
             state.model_type = "lightgbm"
 
             await run_full_pipeline(
@@ -1874,8 +1834,6 @@ async def repl():
                 max_concurrent=max_concurrent,
                 runs_per_message=runs_per_message,
                 provider=provider,
-                collapse_categories=collapse_categories,
-                collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag,
                 include_extra_candidates_as_na=include_extra_candidates_as_na
             )
             
@@ -1952,17 +1910,6 @@ async def repl():
                 continue
             state.model_type = "lightgbm"
             
-            collapse_input = input("Collapse categories for training? (y/N): ").strip().lower()
-            collapse_categories = collapse_input in {"y", "yes"}
-            state.collapse_categories = collapse_categories
-            collapse_ambiguous_to_no_flag = False
-            if collapse_categories:
-                collapse_ambiguous_input = input(
-                    "Collapse ambiguous into no-flag? (y/N): "
-                ).strip().lower()
-                collapse_ambiguous_to_no_flag = collapse_ambiguous_input in {"y", "yes"}
-            state.collapse_ambiguous_to_no_flag = collapse_ambiguous_to_no_flag
-            
             # Prompt for feature subset
             print("\nAvailable features:")
             print(", ".join(FEATURE_NAMES))
@@ -2008,11 +1955,8 @@ async def repl():
             else:
                 state.excluded_message_ids = set()
             
-            # Always prepare data with the selected category handling
             state.X_train, state.X_test, state.y_train, state.y_test = prepare_training_data(
                 state.messages_with_features,
-                collapse_categories=collapse_categories,
-                collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag,
                 active_feature_names=state.active_feature_names,
                 ignored_features=state.ignored_features,
                 exclude_message_ids=state.excluded_message_ids,

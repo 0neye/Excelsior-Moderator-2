@@ -13,8 +13,6 @@ import numpy as np
 
 from config import (
     CONTINUOUS_TRAINING_FEATURE_MODE,
-    CONTINUOUS_TRAINING_COLLAPSE_CATEGORIES,
-    CONTINUOUS_TRAINING_COLLAPSE_AMBIGUOUS,
     EXCLUDE_WAIVER_FILTERED_FROM_TRAINING,
     DEFAULT_LLM_MODEL,
     DEFAULT_LLM_PROVIDER,
@@ -41,11 +39,11 @@ MODEL_SAVE_DIR = Path(__file__).parent / "models"
 
 def load_all_features_from_db() -> dict[int, list[dict[str, float]]]:
     """
-    Load features from the database, including runtime features and the most recent run.
+    Load features from the database, including runtime features and the newest run per message.
 
     Loads:
     1. Features without an extraction_run_id (saved during normal bot operations)
-    2. Features from the most recent extraction run (from bootstrapping)
+    2. Features from the newest extraction run available for each message
 
     Runtime features take priority over bootstrapped features for the same message.
 
@@ -74,38 +72,33 @@ def load_all_features_from_db() -> dict[int, list[dict[str, float]]]:
         runtime_count = len(features_by_message)
         logger.info("Loaded features for %d messages from runtime (no run ID)", runtime_count)
 
-        # Step 2: Get the most recent extraction run
-        latest_run = (
-            session.query(FeatureExtractionRun)
-            .order_by(FeatureExtractionRun.created_at.desc())
-            .first()
+        # Step 2: Choose the newest batch run for each message. A later on-demand
+        # subset must not hide older batch vectors for messages it did not include.
+        run_features = (
+            session.query(MessageFeatures, FeatureExtractionRun)
+            .join(FeatureExtractionRun, MessageFeatures.extraction_run_id == FeatureExtractionRun.id)
+            .order_by(
+                MessageFeatures.message_id,
+                FeatureExtractionRun.created_at.desc(),
+                FeatureExtractionRun.id.desc(),
+                MessageFeatures.run_index,
+            )
+            .all()
         )
 
-        if latest_run:
-            # Load features from the most recent run for messages we don't already have
-            run_features = (
-                session.query(MessageFeatures)
-                .filter(MessageFeatures.extraction_run_id == latest_run.id)
-                .order_by(MessageFeatures.message_id, MessageFeatures.run_index)
-                .all()
-            )
+        runtime_message_ids = set(features_by_message)
+        selected_runs: dict[int, int] = {}
+        for record, extraction_run in run_features:
+            if record.message_id in runtime_message_ids:
+                continue
+            selected_run_id = selected_runs.setdefault(record.message_id, extraction_run.id)
+            if extraction_run.id == selected_run_id:
+                features_by_message.setdefault(record.message_id, []).append(record.features)
 
-            run_messages_added: set[int] = set()
-            for record in run_features:
-                # Only add if we don't already have runtime features for this message
-                if record.message_id not in features_by_message:
-                    features_by_message[record.message_id] = []
-                    run_messages_added.add(record.message_id)
-                # Append features for messages from this run (may have multiple run_index values)
-                if record.message_id in run_messages_added:
-                    features_by_message[record.message_id].append(record.features)
-
-            logger.info(
-                "Loaded features for %d additional messages from run %d (%s)",
-                len(run_messages_added),
-                latest_run.id,
-                latest_run.name or "(unnamed)",
-            )
+        logger.info(
+            "Loaded features for %d additional messages from batch runs",
+            len(selected_runs),
+        )
 
         logger.info("Total: loaded features for %d messages", len(features_by_message))
         return features_by_message
@@ -168,35 +161,26 @@ def load_rated_messages_from_db(
         session.close()
 
 
-def collapse_category_label(
-    category: str,
-    collapse_ambiguous_to_no_flag: bool = False
-) -> str:
+def collapse_category_label(category: str) -> str:
     """
-    Normalize category labels when collapsing classes.
+    Map rating categories to production moderation labels.
     
     Args:
         category: Original rating category
-        collapse_ambiguous_to_no_flag: Whether to map ambiguous to no-flag
-        
     Returns:
-        Collapsed category label following the mapping rules
+        Production moderation label
     """
-    if category in {"NA", "no-flag"}:
+    if category in {"NA", "no-flag", "ambiguous"}:
         return "no-flag"
     if category in {"unsolicited", "unconstructive"}:
         return "flag"
-    if collapse_ambiguous_to_no_flag and category == "ambiguous":
-        return "no-flag"
-    return category
+    raise ValueError(f"Unknown rating category: {category}")
 
 
 def prepare_training_data_simple(
     rated_messages: list[dict],
     features_by_message: dict[int, list[dict[str, float]]],
     feature_names: list[str] | None = None,
-    collapse_categories: bool = False,
-    collapse_ambiguous_to_no_flag: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """
     Prepare feature matrix and labels from rated messages and their features.
@@ -205,9 +189,6 @@ def prepare_training_data_simple(
         rated_messages: List of rated message dicts with message_id and category
         features_by_message: Dict mapping message_id to feature lists
         feature_names: Ordered list of feature names to use (defaults to FEATURE_NAMES)
-        collapse_categories: If True, collapse 5-category ratings to binary flag/no-flag
-        collapse_ambiguous_to_no_flag: If collapsing, whether to map ambiguous to no-flag
-
     Returns:
         Tuple of (feature matrix X, labels y, feature_names used)
     """
@@ -228,22 +209,16 @@ def prepare_training_data_simple(
             feature_vector = [feature_dict.get(name, 0.0) for name in feature_names]
             X.append(feature_vector)
             
-            # Apply category collapsing if enabled
-            label = msg["category"]
-            if collapse_categories:
-                label = collapse_category_label(label, collapse_ambiguous_to_no_flag)
-            y.append(label)
+            y.append(collapse_category_label(msg["category"]))
 
     X = np.array(X)
     y = np.array(y)
 
     label_distribution = dict(zip(*np.unique(y, return_counts=True)))
-    distribution_label = "collapsed label distribution" if collapse_categories else "label distribution"
     logger.info(
-        "Prepared training data: %d samples, %d features, %s: %s",
+        "Prepared training data: %d samples, %d features, label distribution: %s",
         X.shape[0] if len(X) > 0 else 0,
         len(feature_names),
-        distribution_label,
         label_distribution,
     )
 
@@ -254,8 +229,6 @@ async def retrain_model(
     feature_mode: Literal["existing_only", "extract_on_demand"] | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
-    collapse_categories: bool | None = None,
-    collapse_ambiguous_to_no_flag: bool | None = None,
 ) -> bool:
     """
     Retrain the moderation classifier using current ratings and features.
@@ -264,9 +237,6 @@ async def retrain_model(
         feature_mode: How to handle feature extraction. Uses config default if None.
         llm_provider: LLM provider for on-demand extraction. Uses config default if None.
         llm_model: LLM model for on-demand extraction. Uses config default if None.
-        collapse_categories: Whether to collapse categories to binary. Uses config default if None.
-        collapse_ambiguous_to_no_flag: Whether to collapse ambiguous to no-flag. Uses config default if None.
-
     Returns:
         True if retraining succeeded, False otherwise
     """
@@ -277,16 +247,9 @@ async def retrain_model(
         llm_provider = DEFAULT_LLM_PROVIDER
     if llm_model is None:
         llm_model = DEFAULT_LLM_MODEL
-    if collapse_categories is None:
-        collapse_categories = CONTINUOUS_TRAINING_COLLAPSE_CATEGORIES
-    if collapse_ambiguous_to_no_flag is None:
-        collapse_ambiguous_to_no_flag = CONTINUOUS_TRAINING_COLLAPSE_AMBIGUOUS
-
     logger.info(
-        "Starting model retraining (mode=%s, collapse_categories=%s, collapse_ambiguous=%s)...",
+        "Starting binary moderation model retraining (mode=%s)...",
         feature_mode,
-        collapse_categories,
-        collapse_ambiguous_to_no_flag,
     )
 
     try:
@@ -313,8 +276,6 @@ async def retrain_model(
         X, y, feature_names = prepare_training_data_simple(
             rated_messages,
             features_by_message,
-            collapse_categories=collapse_categories,
-            collapse_ambiguous_to_no_flag=collapse_ambiguous_to_no_flag,
         )
 
         if len(X) == 0:
