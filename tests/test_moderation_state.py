@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-class ModerationStateTests(unittest.IsolatedAsyncioTestCase):
+class ModerationTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         # Configure memory storage before importing the startup module.
         import config
@@ -32,6 +32,12 @@ class ModerationStateTests(unittest.IsolatedAsyncioTestCase):
         self.channel.name = "test-channel"
         self.channel.guild = SimpleNamespace(id=456, roles=[])
         self.state = self.bot._get_or_create_channel_state(self.channel.id)
+        self.engine = create_engine("sqlite:///:memory:")
+        self.addCleanup(self.engine.dispose)
+        from db_config import Base
+        Base.metadata.create_all(self.engine)
+        self.sessions = sessionmaker(bind=self.engine)
+        self.bot.get_db_session = self.sessions
         self.enterContext(patch.object(self.module, "is_tracked_channel", return_value=True))
         self.enterContext(patch.object(self.bot, "_ensure_scheduler_task"))
         self.enterContext(patch.object(self.bot, "get_channel", return_value=self.channel))
@@ -57,10 +63,13 @@ class ModerationStateTests(unittest.IsolatedAsyncioTestCase):
                 author=SimpleNamespace(id=789, name="Alice", display_name="Alice"),
                 content="test message", created_at=datetime.now(timezone.utc),
                 edited_at=None, reference=None, attachments=[], reactions=[],
+                add_reaction=AsyncMock(),
             )
             self.bot.message_store.add_message(message)
             await self.bot.notify_moderation_on_message(message)
 
+
+class ModerationStateTests(ModerationTestCase):
     async def test_arrivals_during_extraction_get_a_later_idle_run(self):
         await self.add_messages(1, 30)
         entered, release, later_run = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -182,12 +191,7 @@ class ModerationStateTests(unittest.IsolatedAsyncioTestCase):
 
     async def assert_serialized_actions(self, scheduler_first):
         await self.add_messages(1, 30)
-        engine = create_engine("sqlite:///:memory:")
-        self.addCleanup(engine.dispose)
-        from db_config import Base
-        Base.metadata.create_all(engine)
-        sessions = sessionmaker(bind=engine)
-        self.bot.get_db_session = sessions
+        sessions = self.sessions
         entered, release = asyncio.Event(), asyncio.Event()
         candidate = {
             "discord_message_id": 30, "relative_message_index": 30,
@@ -207,12 +211,19 @@ class ModerationStateTests(unittest.IsolatedAsyncioTestCase):
 
         extractor = self.enterContext(patch.object(self.module, "get_candidate_features", side_effect=extract))
 
-        async def flag(*args, **kwargs):
+        async def send(*args, **kwargs):
             entered.set()
             await release.wait()
-            return 1000
+            return SimpleNamespace(id=1000, add_reaction=AsyncMock())
 
-        action = self.enterContext(patch.object(self.bot, "flag_message", side_effect=flag))
+        log_channel = Mock(spec=self.module.discord.TextChannel)
+        log_channel.id = self.module.LOG_CHANNEL_ID
+        log_channel.send = AsyncMock(side_effect=send)
+        self.enterContext(patch.object(
+            self.bot, "get_channel",
+            side_effect=lambda channel_id: log_channel if channel_id == log_channel.id else self.channel,
+        ))
+        action = log_channel.send
         if scheduler_first:
             self.start(self.bot._moderation_scheduler(self.channel.id))
             await asyncio.wait_for(entered.wait(), 2)

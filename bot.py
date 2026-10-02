@@ -481,57 +481,45 @@ class ExcelsiorBot(discord.Bot):
                 self._ensure_scheduler_task(channel)
     
 
-    async def flag_message(
-        self,
-        message: discord.Message,
-        target_user_id: int | None = None,
-        target_username: str | None = None,
-    ) -> int | None:
-        """
-        Flag a message in Discord and return the created log-channel message ID.
+    async def flag_message(self, flagged_message: FlaggedMessage, db_session: Session) -> int | None:
+        """Deliver a stored flag and persist its log mapping before adding rating reactions."""
+        existing_post = db_session.query(LogChannelRatingPost).filter_by(
+            flagged_message_id=flagged_message.message_id,
+        ).first()
+        if existing_post is not None:
+            return existing_post.bot_message_id
 
-        Args:
-            message: The Discord message to flag.
-            target_user_id: Optional Discord user ID for the message target.
-            target_username: Optional username fallback for the message target.
-        
-        Returns:
-            The log-channel message ID when a post is created, otherwise None.
-        """
-        # Try to react on the original message but continue if the author blocks the bot
-        try:
-            await message.add_reaction(REACTION_EMOJI)
-        except discord.HTTPException as error:
-            logger.warning(
-                "Unable to add moderation reaction to flagged message %s in channel %s: %s",
-                message.id,
-                getattr(message.channel, "id", "unknown"),
-                error,
-            )
+        # A reaction on the original message is separate from moderator-log delivery.
+        if flagged_message.was_acted_upon:
+            flagged_message.was_acted_upon = False
+            db_session.commit()
+        message = self.message_store.get_message_by_id(
+            flagged_message.message_id, flagged_message.channel_id,
+        )
+        if message is not None:
+            try:
+                await message.add_reaction(REACTION_EMOJI)
+            except discord.HTTPException as error:
+                logger.warning("Unable to react to flagged message %s: %s", flagged_message.message_id, error)
 
-        # Post to log channel for mod rating
         log_channel = self.get_channel(LOG_CHANNEL_ID)
-        if not log_channel:
-            logger.warning(
-                "Log channel %s not found; cannot post flagged message %s",
-                LOG_CHANNEL_ID,
-                message.id,
-            )
+        if not isinstance(log_channel, discord.TextChannel):
+            logger.warning("Moderator log channel unavailable for flagged message %s", flagged_message.message_id)
             return None
 
-        # Build the log message content
-        author_name = message.author.display_name or message.author.name
-        # Prefer a clickable user mention when we have a target user ID
+        author_name = flagged_message.author_display_name or flagged_message.author_username
         target_display = (
-            f"<@{target_user_id}>"
-            if isinstance(target_user_id, int)
-            else (target_username or "Unknown / None")
+            f"<@{flagged_message.target_user_id}>"
+            if flagged_message.target_user_id is not None
+            else (flagged_message.target_username or "Unknown / None")
         )
-        jump_url = message.jump_url
-        content_preview = (message.content or "")[:500]
-        if len(message.content or "") > 500:
+        jump_url = (
+            f"https://discord.com/channels/{flagged_message.guild_id}/"
+            f"{flagged_message.channel_id}/{flagged_message.message_id}"
+        )
+        content_preview = flagged_message.content[:500]
+        if len(flagged_message.content) > 500:
             content_preview += "..."
-
         log_content = (
             f"**Flagged Message**\n"
             f"**Author:** {author_name}\n"
@@ -540,38 +528,47 @@ class ExcelsiorBot(discord.Bot):
             f"**Content:**\n```\n{content_preview}\n```\n"
             f"React with: 1️⃣ No Flag | 2️⃣ Ambiguous | 3️⃣ Unconstructive | 4️⃣ Unsolicited | 5️⃣ N/A"
         )
-
-        # Send to log channel (type-check that it's a text channel)
-        if not isinstance(log_channel, discord.TextChannel):
-            logger.warning(
-                "Log channel %s is not a text channel; cannot post flagged message %s",
-                LOG_CHANNEL_ID,
-                message.id,
-            )
+        try:
+            log_message = await log_channel.send(log_content)
+        except discord.HTTPException as error:
+            logger.warning("Moderator log delivery failed for message %s: %s", flagged_message.message_id, error)
             return None
-        log_message = await log_channel.send(log_content)
-        logger.info(
-            "Posted flagged message %s to log channel %s as message %s",
-            message.id,
-            log_channel.id,
-            log_message.id,
-        )
 
-        # Add rating reaction emojis without aborting if one reaction fails
-        rating_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
-        for emoji in rating_emojis:
+        db_session.add(LogChannelRatingPost(
+            bot_message_id=log_message.id, flagged_message_id=flagged_message.message_id,
+        ))
+        flagged_message.was_acted_upon = True
+        db_session.commit()
+        logger.info("Delivered flagged message %s as log post %s", flagged_message.message_id, log_message.id)
+
+        for emoji in ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]:
             try:
                 await log_message.add_reaction(emoji)
             except discord.HTTPException as error:
-                logger.warning(
-                    "Unable to add rating reaction %s to log message %s for flagged message %s: %s",
-                    emoji,
-                    log_message.id,
-                    message.id,
-                    error,
-                )
-
+                logger.warning("Unable to add rating reaction to log post %s: %s", log_message.id, error)
         return log_message.id
+
+    async def _retry_pending_log_deliveries(self, channel_id: int) -> bool:
+        """Retry stored flags independently of candidate extraction or the history window."""
+        db_session = self.get_db_session()
+        try:
+            pending_flags = (
+                db_session.query(FlaggedMessage)
+                .outerjoin(LogChannelRatingPost, LogChannelRatingPost.flagged_message_id == FlaggedMessage.message_id)
+                .filter(
+                    FlaggedMessage.channel_id == channel_id,
+                    FlaggedMessage.waiver_filtered.is_(False),
+                    LogChannelRatingPost.id.is_(None),
+                )
+                .order_by(FlaggedMessage.id)
+                .all()
+            )
+            for flagged_message in pending_flags:
+                if await self.flag_message(flagged_message, db_session) is None:
+                    return False
+            return True
+        finally:
+            db_session.close()
 
 
     async def moderate_channel(self, channel: discord.TextChannel | discord.Thread) -> ModerationResult:
@@ -588,6 +585,10 @@ class ExcelsiorBot(discord.Bot):
             success=False,
             reason="Moderation did not start.",
         )
+
+        if not await self._retry_pending_log_deliveries(channel.id):
+            result.reason = "Moderator log delivery is pending."
+            return result
 
         # Copy at time of call to avoid race conditions
         store_history_copy = self.message_store.get_whole_history(channel.id)
@@ -869,161 +870,79 @@ class ExcelsiorBot(discord.Bot):
         
         db_session = self.get_db_session()
         try:
-            # Collect all candidate IDs that are predicted to be flagged
-            candidate_message_ids_to_flag = [
-                candidate_message.id
-                for candidate, candidate_message, prediction in zip(candidates, candidate_messages, predictions)
-                if prediction == "flag" and candidate_message is not None
-            ]
-            
-            # Query for existing flagged message IDs to avoid duplicate inserts
-            existing_flagged_ids: set[int] = set()
-            runtime_feature_ids: set[int] = set()
-            if candidate_message_ids_to_flag:
-                existing_rows = db_session.query(FlaggedMessage.message_id).filter(
-                    FlaggedMessage.message_id.in_(candidate_message_ids_to_flag)
+            candidate_message_ids_to_flag = {
+                message.id
+                for message, prediction in zip(candidate_messages, predictions)
+                if prediction == "flag"
+            }
+            existing_flags = {
+                row.message_id: row
+                for row in db_session.query(FlaggedMessage).filter(
+                    FlaggedMessage.message_id.in_(candidate_message_ids_to_flag),
                 ).all()
-                existing_flagged_ids = {row[0] for row in existing_rows}
-                result.flagged_existing_count = len(existing_flagged_ids)
-                if existing_flagged_ids:
-                    logger.debug(
-                        "Skipping %d already-flagged message(s) for channel %s",
-                        len(existing_flagged_ids),
-                        channel.id,
-                    )
-                # Check which runtime feature rows already exist so we do not violate unique constraints
-                existing_runtime_feature_rows = (
-                    db_session.query(MessageFeatures.message_id)
-                    .filter(
-                        MessageFeatures.extraction_run_id.is_(None),
-                        MessageFeatures.message_id.in_(candidate_message_ids_to_flag),
-                    )
-                    .all()
-                )
-                runtime_feature_ids = {row[0] for row in existing_runtime_feature_rows}
-            
-            # Collect all flagged messages first, then commit once at the end
-            flagged_messages_to_add: list[FlaggedMessage] = []
-            log_posts_to_add: list[LogChannelRatingPost] = []
-            # Capture runtime feature rows so we retain the model inputs alongside flags
-            feature_records_to_add: list[MessageFeatures] = []
-            waived_action_suppressed_count = 0
-            
+            }
+            result.flagged_existing_count = len(existing_flags)
+            runtime_feature_ids = {
+                row[0] for row in db_session.query(MessageFeatures.message_id).filter(
+                    MessageFeatures.extraction_run_id.is_(None),
+                    MessageFeatures.message_id.in_(candidate_message_ids_to_flag),
+                ).all()
+            }
+
             for candidate, candidate_message, prediction in zip(candidates, candidate_messages, predictions):
-                if prediction == "flag" and candidate_message is not None:
-                    # Apply waiver handling at action-time only when configured to
-                    # persist waived flags for analytics and training
-                    target_user_id = candidate.get("target_user_id")
-                    is_waiver_filtered = (
-                        SAVE_WAIVER_FILTERED_FLAGS
-                        and isinstance(target_user_id, int)
-                        and target_user_id in waiver_target_user_ids
+                if prediction != "flag":
+                    continue
+                target_user_id = candidate.get("target_user_id")
+                is_waiver_filtered = target_user_id in waiver_target_user_ids
+                if is_waiver_filtered and not SAVE_WAIVER_FILTERED_FLAGS:
+                    continue
+
+                flagged_message = existing_flags.get(candidate_message.id)
+                is_new = flagged_message is None
+                if is_new:
+                    context_ids, serialized_context = serialize_context_messages(
+                        [message for message in store_history_copy if message.id != candidate_message.id],
                     )
-                    if (
-                        not SAVE_WAIVER_FILTERED_FLAGS
-                        and isinstance(target_user_id, int)
-                        and target_user_id in waiver_target_user_ids
-                    ):
-                        continue
-
-                    # Skip flag insert when it already exists, but still consider persisting features
-                    if candidate_message.id not in existing_flagged_ids:
-                        logger.info(
-                            "Flagging message %s in channel %s (author_id=%s)",
-                            candidate_message.id,
-                            channel.id,
-                            getattr(candidate_message.author, "id", "unknown"),
-                        )
-                        surrounding_context = [msg for msg in store_history_copy if msg.id != candidate_message.id]
-                        # Serialize surrounding context for persistent storage
-                        context_ids, serialized_context = serialize_context_messages(surrounding_context)
-                        
-                        flagged_message = FlaggedMessage(
-                            message_id=candidate_message.id,
-                            channel_id=channel.id,
-                            guild_id=channel.guild.id,
-                            author_id=candidate_message.author.id,
-                            # Store both display_name and username for user-friendly rendering
-                            author_display_name=getattr(
-                                candidate_message.author, "display_name", None
-                            ),
-                            author_username=candidate_message.author.name,
-                            content=candidate_message.content,
-                            context_message_ids=context_ids,
-                            context_messages=serialized_context,
-                            # Store native datetimes to match the ORM schema
-                            timestamp=candidate_message.created_at if candidate_message.created_at else datetime.now(timezone.utc),
-                            flagged_at=datetime.now(timezone.utc),
-                            target_user_id=candidate.get("target_user_id"),
-                            target_username=candidate.get("target_username"),
-                            was_acted_upon=not is_waiver_filtered,
-                            waiver_filtered=is_waiver_filtered,
-                        )
-                        flagged_messages_to_add.append(flagged_message)
-
-                        # Only post a moderator-facing action when no waiver applies
-                        if is_waiver_filtered:
-                            waived_action_suppressed_count += 1
-                            logger.info(
-                                "Suppressed moderation action for waived target on message %s in channel %s",
-                                candidate_message.id,
-                                channel.id,
-                            )
-                        else:
-                            log_message_id = await self.flag_message(
-                                candidate_message,
-                                target_user_id=target_user_id if isinstance(target_user_id, int) else None,
-                                target_username=(
-                                    candidate.get("target_username")
-                                    if isinstance(candidate.get("target_username"), str)
-                                    else None
-                                ),
-                            )
-                            if log_message_id is not None:
-                                log_posts_to_add.append(
-                                    LogChannelRatingPost(
-                                        bot_message_id=log_message_id,
-                                        flagged_message_id=candidate_message.id,
-                                    )
-                                )
-                    
-                    # Persist runtime feature vector for this flagged message when not already saved
-                    if candidate_message.id not in runtime_feature_ids:
-                        feature_payload = candidate.get("features") or {}
-                        if feature_payload:
-                            target_username = candidate.get("target_username")
-                            feature_record = MessageFeatures(
-                                extraction_run_id=None,  # Null signals runtime (non-batch) extraction
-                                message_id=candidate_message.id,
-                                run_index=0,
-                                features=feature_payload,
-                                target_username=target_username if isinstance(target_username, str) else None,
-                            )
-                            feature_records_to_add.append(feature_record)
-            
-            # Add all flagged messages and runtime feature rows then commit once
-            if flagged_messages_to_add or log_posts_to_add or feature_records_to_add:
-                logger.info(
-                    "Persisting %d flagged message(s), %d log post mapping(s), and %d runtime feature row(s) for channel %s (waiver action suppressed: %d)",
-                    len(flagged_messages_to_add),
-                    len(log_posts_to_add),
-                    len(feature_records_to_add),
-                    channel.id,
-                    waived_action_suppressed_count,
-                )
-                for flagged_message in flagged_messages_to_add:
+                    flagged_message = FlaggedMessage(
+                        message_id=candidate_message.id,
+                        channel_id=channel.id,
+                        guild_id=channel.guild.id,
+                        author_id=candidate_message.author.id,
+                        author_display_name=getattr(candidate_message.author, "display_name", None),
+                        author_username=candidate_message.author.name,
+                        content=candidate_message.content,
+                        context_message_ids=context_ids,
+                        context_messages=serialized_context,
+                        timestamp=candidate_message.created_at or datetime.now(timezone.utc),
+                        flagged_at=datetime.now(timezone.utc),
+                        target_user_id=target_user_id,
+                        target_username=candidate.get("target_username"),
+                        was_acted_upon=False,
+                        waiver_filtered=is_waiver_filtered,
+                    )
                     db_session.add(flagged_message)
-                for log_post in log_posts_to_add:
-                    db_session.add(log_post)
-                for feature_record in feature_records_to_add:
-                    db_session.add(feature_record)
-                db_session.commit()
-                result.flagged_new_count = len(flagged_messages_to_add)
-            else:
-                logger.info(
-                    "No messages flagged for channel %s in this moderation pass",
-                    channel.id,
-                )
+                    existing_flags[candidate_message.id] = flagged_message
+
+                if candidate_message.id not in runtime_feature_ids and candidate.get("features"):
+                    target_username = candidate.get("target_username")
+                    db_session.add(MessageFeatures(
+                        extraction_run_id=None,
+                        message_id=candidate_message.id,
+                        run_index=0,
+                        features=candidate["features"],
+                        target_username=target_username if isinstance(target_username, str) else None,
+                    ))
+                    runtime_feature_ids.add(candidate_message.id)
+
+                result.flagged_new_count += int(is_new)
+
+            # Retain every classified flag, including candidates after a failed send.
+            db_session.commit()
+            for flagged_message in existing_flags.values():
+                if not flagged_message.waiver_filtered:
+                    if await self.flag_message(flagged_message, db_session) is None:
+                        result.reason = "Moderator log delivery is pending."
+                        return result
         finally:
             db_session.close()
 
