@@ -58,6 +58,8 @@ class ChannelModerationState:
     most_recent_message_id: int | None = None
     trigger_event: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task | None = None
+    moderation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    in_flight_message_count: int = 0
     consecutive_failures: int = 0
     cooldown_until: datetime | None = None
 
@@ -299,43 +301,64 @@ class ExcelsiorBot(discord.Bot):
         
         Args:
             channel: Target channel or thread.
-            state: Channel state to reset after completion.
+            state: Channel scheduling state to update after completion.
             trigger_reason: Reason moderation was triggered.
         """
-        logger.info(
-            "Starting moderation for channel %s (reason=%s, messages_since_check=%s, last_checked_message_id=%s)",
-            channel.id,
-            trigger_reason,
-            state.messages_since_check,
-            state.last_checked_message_id,
-        )
-        result = await self.moderate_channel(channel)
+        async with state.moderation_lock:
+            # A manual pass may have consumed the work while the scheduler waited.
+            if trigger_reason != "manual" and not self._should_moderate(state):
+                return ModerationResult(success=True, reason="Scheduled work already consumed.")
 
-        if result.success:
-            # Reset counters after a successful moderation pass
-            self._reset_moderation_failures(state)
-            state.messages_since_check = 0
-            state.has_new_message_since_check = False
-            state.idle_timer_started_at = None
-            state.last_checked_at = datetime.now(timezone.utc)
+            consumed_count = state.messages_since_check
             recent_message = self.message_store.get_most_recent_message(channel.id)
-            state.last_checked_message_id = recent_message.id if recent_message else None
+            consumed_message_id = recent_message.id if recent_message else None
+            previous_idle_timer = state.idle_timer_started_at
+            state.in_flight_message_count = consumed_count
+            succeeded = False
             logger.info(
-                "Moderation completed for channel %s (reason=%s); counters reset (flagged_new=%s, total_flagged=%s)",
+                "Starting moderation for channel %s (reason=%s, messages_since_check=%s, last_checked_message_id=%s)",
                 channel.id,
                 trigger_reason,
-                result.flagged_new_count,
-                result.total_flagged,
+                consumed_count,
+                state.last_checked_message_id,
             )
-        else:
-            self._register_moderation_failure(state, result.reason)
-            logger.warning(
-                "Moderation run returned False for channel %s (reason=%s, details=%s)",
-                channel.id,
-                trigger_reason,
-                result.reason,
-            )
-        return result
+            try:
+                result = await self.moderate_channel(channel)
+                succeeded = result.success
+                if result.success:
+                    self._reset_moderation_failures(state)
+                    state.messages_since_check -= consumed_count
+                    state.has_new_message_since_check = (
+                        state.messages_since_check >= self._get_idle_timer_start_threshold()
+                    )
+                    if not state.has_new_message_since_check:
+                        state.idle_timer_started_at = None
+                    state.last_checked_at = datetime.now(timezone.utc)
+                    state.last_checked_message_id = consumed_message_id
+                    logger.info(
+                        "Moderation completed for channel %s (reason=%s, pending=%s, flagged_new=%s, total_flagged=%s)",
+                        channel.id,
+                        trigger_reason,
+                        state.messages_since_check,
+                        result.flagged_new_count,
+                        result.total_flagged,
+                    )
+                else:
+                    self._register_moderation_failure(state, result.reason)
+                    logger.warning(
+                        "Moderation run returned False for channel %s (reason=%s, details=%s)",
+                        channel.id,
+                        trigger_reason,
+                        result.reason,
+                    )
+                return result
+            except Exception:
+                self._register_moderation_failure(state, "exception")
+                raise
+            finally:
+                state.in_flight_message_count = 0
+                if not succeeded and previous_idle_timer is not None:
+                    state.idle_timer_started_at = previous_idle_timer
 
     async def _moderation_scheduler(self, channel_id: int) -> None:
         """
@@ -387,7 +410,6 @@ class ExcelsiorBot(discord.Bot):
             try:
                 await self._run_moderation(channel, state, trigger_reason)
             except Exception:
-                self._register_moderation_failure(state, "exception")
                 # Log and continue loop so the scheduler keeps running
                 logger.exception(
                     "Moderation run failed for channel %s (reason=%s)",
@@ -412,11 +434,12 @@ class ExcelsiorBot(discord.Bot):
         state = self._get_or_create_channel_state(channel.id)
         state.messages_since_check += 1
         state.most_recent_message_id = message.id
-        # Only start the idle timer once per post-check batch after reaching threshold
+        # Arrivals during extraction belong to the next batch and need their own timer.
+        pending_count = state.messages_since_check - state.in_flight_message_count
+        threshold = self._get_idle_timer_start_threshold()
         if (
-            not state.has_new_message_since_check
-            and state.messages_since_check >= self._get_idle_timer_start_threshold()
-        ):
+            not state.has_new_message_since_check and state.messages_since_check >= threshold
+        ) or pending_count == threshold:
             state.has_new_message_since_check = True
             state.idle_timer_started_at = datetime.now(timezone.utc)
             logger.info(
