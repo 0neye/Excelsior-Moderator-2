@@ -481,6 +481,7 @@ async def _extract_features_on_demand(
     messages_with_features, _ = await extract_features(
         messages_with_context,
         model=llm_model,
+        known_rated_message_ids={message["message_id"] for message in rated_messages},
         provider=llm_provider,
         max_concurrent=5,
         auto_save=True,

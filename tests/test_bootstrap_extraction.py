@@ -6,6 +6,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import discord
+import numpy as np
+import bootstrapping
 from bootstrapping import RatedMessage, extract_features, fetch_discord_context
 
 
@@ -56,6 +59,7 @@ class ExtraCandidateTests(unittest.IsolatedAsyncioTestCase):
             extracted, run_id = await extract_features(
                 messages,
                 model="synthetic",
+                known_rated_message_ids={message.message_id for message in messages},
                 max_concurrent=1,
                 auto_save=False,
                 include_extra_candidates_as_na=True,
@@ -68,6 +72,52 @@ class ExtraCandidateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_id[102].category, "unsolicited")
         self.assertEqual(by_id[103].category, "NA")
         self.assertEqual(len(by_id[103].features), 2)
+
+    async def test_full_pipeline_keeps_failed_context_message_out_of_extra_na_samples(self):
+        messages = [rated_message(101, "unconstructive"), rated_message(102, "unconstructive")]
+        cached = SimpleNamespace(context_messages=messages[0].context_messages, context_message_ids=[101, 102, 103])
+
+        class CacheSession(FakeSession):
+            def query(self, _model):
+                return SimpleNamespace(filter_by=lambda message_id: SimpleNamespace(
+                    first=lambda: cached if message_id == 101 else None,
+                ))
+
+        class UnavailableChannel(FakeTextChannel):
+            async def history(self, **kwargs):
+                raise discord.HTTPException(SimpleNamespace(status=503, reason="synthetic failure"), "synthetic")
+                yield
+
+        client = FakeClient(UnavailableChannel("read_error"))
+        extraction = AsyncMock(return_value=[
+            {"message_id": str(message_id), "features": {"tone_harshness_score": 1.0}}
+            for message_id in (101, 102, 103)
+        ])
+        for target, replacement in (
+            ("state", bootstrapping.BootstrapState()),
+            ("get_session", lambda: CacheSession()),
+            ("DISCORD_BOT_TOKEN", "synthetic-token"),
+        ):
+            self.enterContext(patch.object(bootstrapping, target, replacement))
+        self.enterContext(patch.object(bootstrapping.discord, "Client", return_value=client))
+        self.enterContext(patch.object(bootstrapping.discord, "TextChannel", FakeTextChannel))
+        self.enterContext(patch.object(bootstrapping, "load_rating_data", return_value=messages))
+        for target in ("init_db", "save_to_database", "ensure_user_stats_ready", "train_model", "evaluate_model"):
+            self.enterContext(patch.object(bootstrapping, target))
+        self.enterContext(patch.object(bootstrapping, "save_features_to_db", return_value=1))
+        self.enterContext(patch.object(bootstrapping, "extract_features_from_formatted_history", extraction))
+        prepare = self.enterContext(patch.object(bootstrapping, "prepare_training_data", return_value=(
+            np.zeros((1, 1)), np.zeros((1, 1)), np.array(["flag"]), np.array(["no-flag"]),
+        )))
+
+        await bootstrapping.run_full_pipeline(model="synthetic", include_extra_candidates_as_na=True)
+
+        prepared = prepare.call_args.args[0]
+        self.assertEqual([(message.message_id, message.category) for message in prepared], [
+            (101, "unconstructive"), (103, "NA"),
+        ])
+        self.assertEqual([message.message_id for message in bootstrapping.state.messages_with_context], [101])
+        self.assertEqual(client.closed, 1)
 
 
 class FakeQuery:

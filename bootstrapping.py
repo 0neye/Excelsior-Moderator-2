@@ -933,6 +933,7 @@ def list_extraction_runs() -> list[dict[str, Any]]:
 async def extract_features(
     rated_messages: list[RatedMessage],
     model: str,
+    known_rated_message_ids: set[int],
     max_concurrent: int = 5,
     runs_per_message: int = 1,
     provider: str = "gemini",
@@ -953,6 +954,7 @@ async def extract_features(
     
     Args:
         rated_messages: List of rated messages with context
+        known_rated_message_ids: Complete rated corpus, including failed context fetches
         model: Model identifier to use for the chosen provider
         max_concurrent: Maximum number of concurrent API calls
         runs_per_message: How many times to run feature extraction per message
@@ -976,7 +978,7 @@ async def extract_features(
     
     # Filter messages that have context
     messages_to_process = [m for m in rated_messages if m.context_messages]
-    rated_message_ids = {message.message_id for message in rated_messages}
+    rated_message_ids = known_rated_message_ids | {message.message_id for message in rated_messages}
     skipped = len(rated_messages) - len(messages_to_process)
     if skipped > 0:
         logger.warning(f"Skipping {skipped} messages without context")
@@ -1785,6 +1787,7 @@ async def run_full_pipeline(
     state.messages_with_features, extraction_run_id = await extract_features(
         state.messages_with_context,
         model=model,
+        known_rated_message_ids={message.message_id for message in state.rated_messages},
         max_concurrent=max_concurrent,
         runs_per_message=runs_per_message,
         provider=provider,
@@ -1928,6 +1931,7 @@ async def repl():
             state.messages_with_features, extraction_run_id = await extract_features(
                 messages,
                 model=model,
+                known_rated_message_ids={message.message_id for message in state.rated_messages},
                 max_concurrent=max_concurrent,
                 runs_per_message=runs_per_message,
                 provider=provider,
