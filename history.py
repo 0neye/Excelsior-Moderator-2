@@ -20,7 +20,7 @@ class ChannelInfo:
 class MessageStore:
     """
     In-memory message store using deques with fixed maximum size per channel.
-    Automatically removes oldest messages when capacity is reached for each channel.
+    Keeps unique messages in chronological Discord ID order and removes the oldest at capacity.
     Maintains separate message histories for each channel ID.
     """
     
@@ -98,8 +98,8 @@ class MessageStore:
     
     def add_message(self, message: discord.Message) -> None:
         """
-        Add a message to the store for its channel.
-        If the store is at capacity for that channel, the oldest message is automatically removed.
+        Add a message once in chronological order for its channel.
+        At capacity, retain the newest messages, including live reconnect arrivals.
         Also updates channel metadata (name, parent info for threads).
         
         Args:
@@ -108,7 +108,14 @@ class MessageStore:
         channel = message.channel
         channel_id = channel.id
         channel_deque = self._get_channel_deque(channel_id)
-        channel_deque.append(message)
+        if not any(stored.id == message.id for stored in channel_deque):
+            if not channel_deque or message.id > channel_deque[-1].id:
+                channel_deque.append(message)
+            else:
+                # Reconnect history can arrive after newer live messages.
+                ordered = sorted([*channel_deque, message], key=lambda stored: stored.id)
+                channel_deque.clear()
+                channel_deque.extend(ordered[-self._max_size:])
         
         # Update channel info (handles both TextChannel and Thread)
         if isinstance(channel, (discord.TextChannel, discord.Thread)):
