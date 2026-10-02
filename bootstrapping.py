@@ -93,6 +93,8 @@ class RatedMessage:
     category: str  # Rating category (no-flag, unsolicited, unconstructive, ambiguous, NA)
     rater_user_id: int
     rating_id: str
+    rating_started_at: str | None = None
+    rating_completed_at: str | None = None
     channel_name: str | None = None
     thread_name: str | None = None
     context_message_ids: list[int] = field(default_factory=list)
@@ -279,7 +281,7 @@ def load_flagged_messages_into_db() -> int:
                     context_messages=[],
                     timestamp=timestamp,
                     flagged_at=flagged_at,
-                    # Bootstrapped historical rows are treated as actionable by default
+                    # Historical imports are already handled, never pending delivery.
                     was_acted_upon=True,
                     waiver_filtered=False,
                 )
@@ -304,6 +306,32 @@ def load_flagged_messages_into_db() -> int:
         raise
     finally:
         session.close()
+
+
+def _vote_timestamps(message: RatedMessage) -> tuple[datetime, datetime]:
+    def parse(value: str) -> datetime:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+        return timestamp
+
+    started = parse(message.rating_started_at or message.rating_completed_at or message.flagged_at or message.timestamp)
+    completed = parse(message.rating_completed_at) if message.rating_completed_at else started
+    return started, completed
+
+
+def _latest_votes(messages: list[RatedMessage]) -> list[RatedMessage]:
+    votes: dict[tuple[int, int], RatedMessage] = {}
+    for message in messages:
+        if not message.category:
+            continue
+        pair = (message.rater_user_id, message.message_id)
+        previous = votes.get(pair)
+        if previous is None or (*reversed(_vote_timestamps(message)), message.rating_id) > (
+            *reversed(_vote_timestamps(previous)), previous.rating_id
+        ):
+            votes[pair] = message
+    return list(votes.values())
 
 
 def load_rating_data() -> list[RatedMessage]:
@@ -340,7 +368,7 @@ def load_rating_data() -> list[RatedMessage]:
     for rating_id, rating_data in ratings.items():
         msg_id = rating_data.get("flagged_message_id")
         if msg_id and rating_data.get("category"):  # Only include completed ratings
-            message_to_ratings[msg_id].append(rating_data)
+            message_to_ratings[int(msg_id)].append({**rating_data, "rating_id": rating_data.get("rating_id") or rating_id})
     
     logger.info(f"Messages with completed ratings: {len(message_to_ratings)}")
     
@@ -375,8 +403,15 @@ def load_rating_data() -> list[RatedMessage]:
                     category=category,
                     rater_user_id=rating["rater_user_id"],
                     rating_id=rating["rating_id"],
+                    rating_started_at=rating.get("started_at"),
+                    rating_completed_at=rating.get("completed_at"),
                 )
             )
+
+    rated_messages = _latest_votes(rated_messages)
+    category_counts = defaultdict(int)
+    for message in rated_messages:
+        category_counts[message.category] += 1
     
     # Log category distribution
     logger.info("Category distribution:")
@@ -593,11 +628,13 @@ def save_to_database(rated_messages: list[RatedMessage]) -> None:
     updated_count = 0
     
     try:
-        for rated_msg in rated_messages:
-            # Check if message already exists
-            existing = session.query(FlaggedMessage).filter_by(
-                message_id=rated_msg.message_id
-            ).first()
+        messages_by_id = {row.message_id: row for row in session.query(FlaggedMessage).all()}
+        ratings_by_pair = {
+            (row.rater_user_id, row.flagged_message_id): row
+            for row in session.query(FlaggedMessageRating).all()
+        }
+        for rated_msg in _latest_votes(rated_messages):
+            existing = messages_by_id.get(rated_msg.message_id)
             
             if existing:
                 # Update existing record with context data
@@ -617,36 +654,35 @@ def save_to_database(rated_messages: list[RatedMessage]) -> None:
                     context_messages=rated_msg.context_messages,
                     timestamp=datetime.fromisoformat(rated_msg.timestamp.replace("Z", "+00:00")),
                     flagged_at=datetime.fromisoformat(rated_msg.flagged_at.replace("Z", "+00:00")),
-                    # Imported rated rows predate waiver metadata and should remain actionable
+                    # Completed historical imports never enqueue Discord delivery.
                     was_acted_upon=True,
                     waiver_filtered=False,
                 )
                 session.add(flagged_msg)
+                messages_by_id[rated_msg.message_id] = flagged_msg
                 saved_count += 1
             
-            # Check if rating already exists
-            existing_rating = session.query(FlaggedMessageRating).filter_by(
-                rating_id=rated_msg.rating_id
-            ).first()
-            
-            if not existing_rating:
-                # Map category string to enum
-                category_map = {
-                    "no-flag": RatingCategory.NO_FLAG,
-                    "unsolicited": RatingCategory.UNSOLICITED,
-                    "unconstructive": RatingCategory.UNCONSTRUCTIVE,
-                    "ambiguous": RatingCategory.AMBIGUOUS,
-                    "NA": RatingCategory.NA,
-                }
-                
-                rating = FlaggedMessageRating(
-                    rating_id=rated_msg.rating_id,
+            pair = (rated_msg.rater_user_id, rated_msg.message_id)
+            existing_rating = ratings_by_pair.get(pair)
+            started_at, completed_at = _vote_timestamps(rated_msg)
+            if existing_rating is not None:
+                existing_completed = existing_rating.completed_at or existing_rating.started_at
+                if existing_rating.category is not None and (
+                    existing_completed, existing_rating.started_at, existing_rating.rating_id
+                ) >= (completed_at, started_at, rated_msg.rating_id):
+                    continue
+            else:
+                existing_rating = FlaggedMessageRating(
                     flagged_message_id=rated_msg.message_id,
                     rater_user_id=rated_msg.rater_user_id,
-                    category=category_map.get(rated_msg.category),
-                    completed_at=datetime.now(timezone.utc),
                 )
-                session.add(rating)
+                session.add(existing_rating)
+                ratings_by_pair[pair] = existing_rating
+
+            existing_rating.rating_id = rated_msg.rating_id
+            existing_rating.category = RatingCategory(rated_msg.category)
+            existing_rating.started_at = started_at
+            existing_rating.completed_at = completed_at
         
         session.commit()
         logger.info(f"Database save complete: {saved_count} new, {updated_count} updated")
@@ -857,6 +893,8 @@ def load_features_from_db(
                         category=rating.category.value,
                         rater_user_id=rating.rater_user_id,
                         rating_id=rating.rating_id,
+                        rating_started_at=rating.started_at.isoformat(),
+                        rating_completed_at=rating.completed_at.isoformat(),
                         context_message_ids=flagged_msg.context_message_ids or [],
                         context_messages=flagged_msg.context_messages or [],
                         features=feature_list,
@@ -1496,7 +1534,7 @@ def prepare_training_data(
     )
     label_distribution = dict(zip(*np.unique(y, return_counts=True)))
     logger.info(f"Label distribution: {label_distribution}")
-    
+
     groups = np.array(message_ids)
     unique_message_ids = np.unique(groups)
     if len(unique_message_ids) < 2:
@@ -1530,6 +1568,11 @@ def prepare_training_data(
 
     X_train, X_test = X[train_indices], X[test_indices]
     y_train, y_test = y[train_indices], y[test_indices]
+    if set(y_train) != {"flag", "no-flag"}:
+        raise ValueError(
+            "Grouped training split requires both flag and no-flag labels; "
+            "collect more rated messages or adjust the split"
+        )
     
     logger.info(f"Train set size: {len(y_train)}")
     logger.info(f"Test set size: {len(y_test)}")

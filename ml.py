@@ -218,8 +218,8 @@ class LightGBMClassifier(ModerationClassifier):
         import lightgbm as lgb
 
         labels = set(map(str, y))
-        if not labels <= {"flag", "no-flag"}:
-            raise ValueError(f"Moderation models require flag/no-flag labels, got {sorted(labels)}")
+        if labels != {"flag", "no-flag"}:
+            raise ValueError(f"Moderation models require both flag and no-flag labels, got {sorted(labels)}")
 
         logger.info(f"Training LightGBM with {len(y)} samples...")
 
