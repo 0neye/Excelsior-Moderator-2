@@ -399,7 +399,7 @@ class ModFlagInvestigationView(discord.ui.View):
         return (
             f"{record_index}. <@{record['author_id']}> in <#{record['channel_id']}> at "
             f"<t:{int(flagged_at.timestamp())}:R> - "
-            f"[Jump](https://discord.com/channels/{self.guild_id}/{record['channel_id']}/{record['message_id']})"
+            f"msg `{record['message_id']}`"
             f"{waiver_suffix}{selected_marker}"
         )
 
@@ -443,6 +443,7 @@ class ModFlagInvestigationView(discord.ui.View):
         Returns:
             List-view embed for selecting a flagged record
         """
+        # Compact IDs keep all 25 records visible; full jump links are in overview.
         recent_lines = [
             self._format_recent_line(record_index, record)
             for record_index, record in enumerate(self.recent_records, start=1)
@@ -455,7 +456,7 @@ class ModFlagInvestigationView(discord.ui.View):
         embed.add_field(
             name="How to Use",
             value=(
-                "Pick a message from the dropdown, then click **Open Selected**. "
+                "Pick a message from the dropdown, then click **Open Selected** for its jump link. "
                 "Use **Features** and **History** to drill into the moderation decision."
             ),
             inline=False,
@@ -484,7 +485,7 @@ class ModFlagInvestigationView(discord.ui.View):
                 f"**Author:** <@{payload['author_id']}>\n"
                 f"**Target:** {payload['target_display']}\n"
                 f"**Flagged:** <t:{int(payload['flagged_at'].timestamp())}:F>\n"
-                f"**Action Taken:** {'Yes' if payload['was_acted_upon'] else 'No'}\n"
+                f"**Moderator Log Delivered:** {'Yes' if payload['was_acted_upon'] else 'No'}\n"
                 f"**Waiver Filtered:** {'Yes' if payload['waiver_filtered'] else 'No'}\n"
                 f"**Jump:** [Open message]({jump_url})"
             ),
