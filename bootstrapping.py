@@ -54,7 +54,7 @@ from user_stats import (
     get_familiarity_score_stat,
     get_seniority_scores,
 )
-from utils import serialize_context_messages
+from utils import run_discord_bootstrap, serialize_context_messages
 
 # Configure logging with timestamps and level
 logging.basicConfig(
@@ -489,122 +489,102 @@ async def fetch_discord_context(rated_messages: list[RatedMessage]) -> list[Rate
     
     # List to collect newly fetched messages (accessible in on_ready closure)
     newly_fetched: list[RatedMessage] = []
-    client_closed = False
 
-    async def close_client() -> None:
-        nonlocal client_closed
-        if not client_closed:
-            client_closed = True
-            await client.close()
-    
-    @client.event
-    async def on_ready():
-        """Triggered when Discord client is ready."""
-        try:
-            logger.info(f"Connected to Discord as {client.user}")
-            logger.info(f"Connected to {len(client.guilds)} guild(s)")
-            messages_by_channel: dict[int, list[RatedMessage]] = defaultdict(list)
-            for msg in messages_needing_fetch:
-                messages_by_channel[msg.channel_id].append(msg)
-            logger.info(f"Messages spread across {len(messages_by_channel)} channels")
-            processed = 0
-            for channel_id, channel_messages in messages_by_channel.items():
-                logger.info(f"Processing channel {channel_id} ({len(channel_messages)} messages)...")
-                channel = client.get_channel(channel_id)
-                if channel is None:
-                    try:
-                        channel = await client.fetch_channel(channel_id)
-                    except discord.NotFound:
-                        logger.warning(f"Channel {channel_id} not found, skipping {len(channel_messages)} messages")
-                        fetch_errors["channel_not_found"] += len(channel_messages)
-                        continue
-                    except discord.Forbidden:
-                        logger.warning(f"No access to channel {channel_id}, skipping {len(channel_messages)} messages")
-                        fetch_errors["channel_forbidden"] += len(channel_messages)
-                        continue
-                    except discord.HTTPException as exc:
-                        logger.warning(f"Could not fetch channel {channel_id}: {exc}")
-                        fetch_errors["channel_http_error"] += len(channel_messages)
-                        continue
-                messageable_channel = channel
-                if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-                    logger.warning(f"Channel {channel_id} is not a text channel, skipping")
+    async def collect_context():
+        logger.info(f"Connected to Discord as {client.user}")
+        logger.info(f"Connected to {len(client.guilds)} guild(s)")
+        messages_by_channel: dict[int, list[RatedMessage]] = defaultdict(list)
+        for msg in messages_needing_fetch:
+            messages_by_channel[msg.channel_id].append(msg)
+        logger.info(f"Messages spread across {len(messages_by_channel)} channels")
+        processed = 0
+        for channel_id, channel_messages in messages_by_channel.items():
+            logger.info(f"Processing channel {channel_id} ({len(channel_messages)} messages)...")
+            channel = client.get_channel(channel_id)
+            if channel is None:
+                try:
+                    channel = await client.fetch_channel(channel_id)
+                except discord.NotFound:
+                    logger.warning(f"Channel {channel_id} not found, skipping {len(channel_messages)} messages")
+                    fetch_errors["channel_not_found"] += len(channel_messages)
                     continue
-                parent_channel_name: str | None = None
-                thread_name: str | None = None
-                if isinstance(channel, discord.Thread):
-                    thread_name = channel.name
-                    parent_channel_name = channel.parent.name if channel.parent else None
-                    channel_name = parent_channel_name or channel.name
-                else:
-                    channel_name = channel.name
-                for rated_msg in channel_messages:
-                    try:
-                        context_messages: list[discord.Message] = []
-                        before_count = HISTORY_PER_CHECK // 2
-                        async for msg in messageable_channel.history(
-                            limit=before_count,
-                            before=discord.Object(id=rated_msg.message_id),
-                            oldest_first=False,
-                        ):
-                            context_messages.append(msg)
-                        context_messages.reverse()
-                        flagged_msg = await messageable_channel.fetch_message(rated_msg.message_id)
-                        context_messages.append(flagged_msg)
-                        after_count = HISTORY_PER_CHECK - before_count - 1
-                        async for msg in messageable_channel.history(
-                            limit=after_count,
-                            after=discord.Object(id=rated_msg.message_id),
-                            oldest_first=True,
-                        ):
-                            context_messages.append(msg)
-                        context_ids, serialized_context = serialize_context_messages(
-                            context_messages,
-                            channel_name=channel_name,
-                            parent_channel_name=parent_channel_name,
-                            thread_name=thread_name,
-                        )
-                        rated_msg.context_message_ids = context_ids
-                        rated_msg.channel_name = channel_name
-                        rated_msg.thread_name = thread_name
-                        rated_msg.context_messages = serialized_context
-                        newly_fetched.append(rated_msg)
-                        processed += 1
-                        if processed % 10 == 0:
-                            logger.info(f"Processed {processed}/{len(messages_needing_fetch)} messages")
-                        await asyncio.sleep(0.5)
-                    except discord.Forbidden:
-                        logger.warning(f"No access while fetching context for message {rated_msg.message_id}")
-                        fetch_errors["message_forbidden"] += 1
-                    except discord.NotFound:
-                        logger.warning(f"Context for message {rated_msg.message_id} was not found")
-                        fetch_errors["message_not_found"] += 1
-                    except discord.HTTPException as exc:
-                        logger.warning(f"HTTP error fetching context for message {rated_msg.message_id}: {exc}")
-                        fetch_errors["message_http_error"] += 1
-                    except Exception as exc:
-                        logger.error(f"Error fetching context for message {rated_msg.message_id}: {exc}")
-                        fetch_errors["other_error"] += 1
-            logger.info(f"Discord fetch complete: {len(newly_fetched)}/{len(messages_needing_fetch)} successful")
+                except discord.Forbidden:
+                    logger.warning(f"No access to channel {channel_id}, skipping {len(channel_messages)} messages")
+                    fetch_errors["channel_forbidden"] += len(channel_messages)
+                    continue
+                except discord.HTTPException as exc:
+                    logger.warning(f"Could not fetch channel {channel_id}: {exc}")
+                    fetch_errors["channel_http_error"] += len(channel_messages)
+                    continue
+            messageable_channel = channel
+            if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+                logger.warning(f"Channel {channel_id} is not a text channel, skipping")
+                continue
+            parent_channel_name: str | None = None
+            thread_name: str | None = None
+            if isinstance(channel, discord.Thread):
+                thread_name = channel.name
+                parent_channel_name = channel.parent.name if channel.parent else None
+                channel_name = parent_channel_name or channel.name
+            else:
+                channel_name = channel.name
+            for rated_msg in channel_messages:
+                try:
+                    context_messages: list[discord.Message] = []
+                    before_count = HISTORY_PER_CHECK // 2
+                    async for msg in messageable_channel.history(
+                        limit=before_count,
+                        before=discord.Object(id=rated_msg.message_id),
+                        oldest_first=False,
+                    ):
+                        context_messages.append(msg)
+                    context_messages.reverse()
+                    flagged_msg = await messageable_channel.fetch_message(rated_msg.message_id)
+                    context_messages.append(flagged_msg)
+                    after_count = HISTORY_PER_CHECK - before_count - 1
+                    async for msg in messageable_channel.history(
+                        limit=after_count,
+                        after=discord.Object(id=rated_msg.message_id),
+                        oldest_first=True,
+                    ):
+                        context_messages.append(msg)
+                    context_ids, serialized_context = serialize_context_messages(
+                        context_messages,
+                        channel_name=channel_name,
+                        parent_channel_name=parent_channel_name,
+                        thread_name=thread_name,
+                    )
+                    rated_msg.context_message_ids = context_ids
+                    rated_msg.channel_name = channel_name
+                    rated_msg.thread_name = thread_name
+                    rated_msg.context_messages = serialized_context
+                    newly_fetched.append(rated_msg)
+                    processed += 1
+                    if processed % 10 == 0:
+                        logger.info(f"Processed {processed}/{len(messages_needing_fetch)} messages")
+                    await asyncio.sleep(0.5)
+                except discord.Forbidden:
+                    logger.warning(f"No access while fetching context for message {rated_msg.message_id}")
+                    fetch_errors["message_forbidden"] += 1
+                except discord.NotFound:
+                    logger.warning(f"Context for message {rated_msg.message_id} was not found")
+                    fetch_errors["message_not_found"] += 1
+                except discord.HTTPException as exc:
+                    logger.warning(f"HTTP error fetching context for message {rated_msg.message_id}: {exc}")
+                    fetch_errors["message_http_error"] += 1
+                except Exception as exc:
+                    logger.error(f"Error fetching context for message {rated_msg.message_id}: {exc}")
+                    fetch_errors["other_error"] += 1
+        logger.info(f"Discord fetch complete: {len(newly_fetched)}/{len(messages_needing_fetch)} successful")
 
-            # Log error summary
-            if fetch_errors:
-                logger.info("Fetch errors:")
-                for error_type, count in fetch_errors.items():
-                    logger.info(f"  {error_type}: {count}")
-        finally:
-            await close_client()
-    
-    # Run the client
-    try:
-        if DISCORD_BOT_TOKEN is None:
-            raise ValueError("DISCORD_BOT_TOKEN is not set in environment")
-        await client.start(DISCORD_BOT_TOKEN)
-    except Exception as e:
-        logger.error(f"Discord client error: {e}")
-    finally:
-        await close_client()
-    
+        # Log error summary
+        if fetch_errors:
+            logger.info("Fetch errors:")
+            for error_type, count in fetch_errors.items():
+                logger.info(f"  {error_type}: {count}")
+
+    await run_discord_bootstrap(client, DISCORD_BOT_TOKEN, collect_context)
+
     # Combine cached and newly fetched messages
     messages_with_context.extend(newly_fetched)
     logger.info(f"Total messages with context: {len(messages_with_context)} ({len(messages_with_context) - len(newly_fetched)} cached, {len(newly_fetched)} fetched)")

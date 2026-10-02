@@ -1,4 +1,5 @@
-from typing import Any, Optional, Tuple, List, Union
+from typing import Any, Awaitable, Callable, Optional, Tuple, List, Union
+import asyncio
 import re
 import discord
 
@@ -14,6 +15,69 @@ TrackableChannel = Union[
     discord.abc.PrivateChannel,
     discord.abc.Messageable,
 ]
+
+
+async def run_discord_bootstrap(
+    client: discord.Client,
+    token: str | None,
+    collect: Callable[[], Awaitable[None]],
+) -> None:
+    """Run one ready-handler batch and own its task and client through cleanup."""
+    owner_task = asyncio.current_task()
+    ready_task: asyncio.Task | None = None
+    ready_error: BaseException | None = None
+    close_task: asyncio.Task | None = None
+    stopping = False
+
+    async def close_client():
+        nonlocal close_task
+        if close_task is None:
+            close_task = asyncio.create_task(client.close())
+        await asyncio.shield(close_task)
+
+    @client.event
+    async def on_ready():
+        nonlocal ready_task, ready_error
+        if stopping or ready_task is not None:
+            return
+        ready_task = asyncio.current_task()
+        try:
+            await collect()
+        except (Exception, asyncio.CancelledError) as error:
+            # py-cord swallows event failures; retain the outcome for our caller.
+            ready_error = error
+        finally:
+            await close_client()
+
+    async def cleanup():
+        nonlocal stopping
+        stopping = True
+        if ready_task is not None and ready_task is not owner_task:
+            if not ready_task.done():
+                ready_task.cancel()
+            await asyncio.gather(ready_task, return_exceptions=True)
+        await close_client()
+
+    try:
+        if token is None:
+            raise ValueError("DISCORD_BOT_TOKEN is not set")
+        await client.start(token)
+        if ready_task is not None and ready_task is not owner_task:
+            await ready_task
+    finally:
+        cleanup_task = asyncio.create_task(cleanup())
+        cancellation = None
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError as error:
+                cancellation = error
+        cleanup_task.result()
+        if cancellation is not None:
+            raise cancellation
+
+    if ready_error is not None:
+        raise ready_error
 
 
 def is_tracked_channel(channel: TrackableChannel) -> bool:

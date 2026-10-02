@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from config import CHANNEL_ALLOW_LIST, DISCORD_BOT_TOKEN
 from database import UserCoOccurrence, UserStats
 from db_config import Base, engine, get_session, init_db
+from utils import run_discord_bootstrap
 
 # Defaults chosen to balance coverage and API limits
 DEFAULT_HISTORY_LIMIT = 10_000
@@ -384,63 +385,28 @@ async def bootstrap_user_stats(
     processed_windows = 0
     channel_scope = channel_ids or CHANNEL_ALLOW_LIST
 
-    ready_task: asyncio.Task | None = None
-    ready_error: BaseException | None = None
-    close_task: asyncio.Task | None = None
+    async def collect_stats():
+        nonlocal processed_channels, processed_messages, processed_windows
+        if progress_callback and client.user:
+            progress_callback(f"Connected as {client.user}")
 
-    async def close_client():
-        nonlocal close_task
-        if close_task is None:
-            close_task = asyncio.create_task(client.close())
-        await asyncio.shield(close_task)
+        for guild in client.guilds:
+            for channel_id in channel_scope:
+                channel = guild.get_channel(channel_id)
+                if not isinstance(channel, (discord.ForumChannel, discord.TextChannel)):
+                    continue
+                msg_count, windows = await _process_channel_and_threads(
+                    channel,
+                    get_session,
+                    limit_per_channel,
+                    window_size,
+                    progress_callback,
+                )
+                processed_channels += 1
+                processed_messages += msg_count
+                processed_windows += windows
 
-    @client.event
-    async def on_ready():
-        nonlocal processed_channels, processed_messages, processed_windows, ready_task, ready_error
-        # Reconnects must not repeat the historical statistics import.
-        if ready_task is not None:
-            return
-        ready_task = asyncio.current_task()
-        try:
-            if progress_callback and client.user:
-                progress_callback(f"Connected as {client.user}")
-
-            for guild in client.guilds:
-                for channel_id in channel_scope:
-                    channel = guild.get_channel(channel_id)
-                    if not isinstance(channel, (discord.ForumChannel, discord.TextChannel)):
-                        continue
-                    msg_count, windows = await _process_channel_and_threads(
-                        channel,
-                        get_session,
-                        limit_per_channel,
-                        window_size,
-                        progress_callback,
-                    )
-                    processed_channels += 1
-                    processed_messages += msg_count
-                    processed_windows += windows
-        except (Exception, asyncio.CancelledError) as error:
-            # py-cord's _run_event swallows errors and cancellation. Preserve the
-            # outcome for the caller and close so client.start can finish.
-            ready_error = error
-        finally:
-            await close_client()
-
-    try:
-        if DISCORD_BOT_TOKEN is None:
-            raise ValueError("DISCORD_BOT_TOKEN is not set")
-        await client.start(DISCORD_BOT_TOKEN)
-        if ready_task is not None and ready_task is not asyncio.current_task():
-            await ready_task
-    finally:
-        if ready_task is not None and ready_task is not asyncio.current_task() and not ready_task.done():
-            ready_task.cancel()
-            await asyncio.gather(ready_task, return_exceptions=True)
-        await close_client()
-
-    if ready_error is not None:
-        raise ready_error
+    await run_discord_bootstrap(client, DISCORD_BOT_TOKEN, collect_stats)
 
     return {
         "channels_processed": processed_channels,
